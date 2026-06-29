@@ -1,0 +1,41 @@
+services:
+  # 1. The Redis Database
+  redis:
+    image: redis:alpine
+    command: redis-server --protected-mode no
+    ports:
+      - "6380:6379"
+    restart: always
+    healthcheck:
+      # Confirms Redis is actually accepting connections, not just that
+      # the container process has started. 'depends_on' alone only waits
+      # for the container to start, which is what caused the DNS-lookup
+      # race in main.py's _connect_redis() -- the backend would start
+      # trying to resolve 'redis' before Redis itself was really ready.
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 5s
+
+  # 2. The Unified Web Dashboard & API (Flask + React, built in one image)
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    ports:
+      - "5000:5000"
+    env_file:
+      - ./backend/.env
+    environment:
+      - REDIS_HOST=redis
+    cap_add:
+      # Required for Scapy to actually open a raw capture socket.
+      # Without these, real packet capture silently fails to bind --
+      # the dashboard would run, but never see real traffic.
+      - NET_ADMIN
+      - NET_RAW
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy

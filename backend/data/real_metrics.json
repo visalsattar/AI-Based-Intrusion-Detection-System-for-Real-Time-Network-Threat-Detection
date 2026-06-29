@@ -1,0 +1,43 @@
+{
+  "methodology": "All metrics computed on a held-out test set none of the models saw during training or threshold selection. Autoencoder threshold derived from benign training reconstruction error only.",
+  "test_set_size": 45149,
+  "autoencoder": {
+    "accuracy": 0.7722651664488693,
+    "precision": 0.553715710723192,
+    "recall": 0.48868738445285675,
+    "f1_score": 0.5191732136176581,
+    "roc_auc": 0.7723447003015288,
+    "threshold": 0.002732993569225073,
+    "threshold_percentile": 90,
+    "confusion_matrix": {
+      "tn": 29316,
+      "fp": 4474,
+      "fn": 5808,
+      "tp": 5551
+    }
+  },
+  "random_forest": {
+    "accuracy": 0.9974971760171876,
+    "precision": 0.9926406167864027,
+    "recall": 0.9974469583590104,
+    "f1_score": 0.995037983577043,
+    "confusion_matrix": {
+      "tn": 33706,
+      "fp": 84,
+      "fn": 29,
+      "tp": 11330
+    }
+  },
+  "cnn": {
+    "accuracy": 0.9991120976692563,
+    "precision": 0.9973427812223207,
+    "recall": 0.9991126885536823,
+    "f1_score": 0.99822695035461,
+    "confusion_matrix": {
+      "tn": 3375,
+      "fp": 3,
+      "fn": 1,
+      "tp": 1126
+    }
+  }
+}

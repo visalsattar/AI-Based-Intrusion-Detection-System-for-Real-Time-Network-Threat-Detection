@@ -1,0 +1,14 @@
+/* frontend/src/App.css */
+@import './styles/global.css';
+@import './styles/Dashboard.css';
+@import './styles/Navbar.css';
+@import './styles/Pages.css';
+
+body {
+  margin: 0;
+  background-color: #020617;
+  color: #f8fafc;
+}
+
+.app-container { min-height: 100vh; }
+.main-content { padding: 2rem; }

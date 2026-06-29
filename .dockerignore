@@ -1,0 +1,30 @@
+# .dockerignore (PROJECT ROOT)
+# Build context is now the project root (docker-compose.yml ->
+# backend.build.context: .), so .dockerignore must live here, not in
+# backend/, for either stage of the multi-stage build to respect it.
+
+# --- Secrets: never baked into an image layer ---
+backend/.env
+backend/.env.local
+
+# --- Backend dev junk, not needed inside the image ---
+backend/__pycache__/
+backend/**/__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+backend/logs/
+*.log
+backend/tests/
+backend/data/
+
+# --- Frontend: node_modules is reinstalled fresh via `npm ci` inside
+# the frontend-builder stage; a stale local build/ shouldn't be
+# copied in either, since the builder stage regenerates it ---
+frontend/node_modules/
+frontend/build/
+
+# --- General ---
+.git/
+**/.DS_Store
+Thumbs.db
