@@ -28,7 +28,8 @@ services:
     env_file:
       - ./backend/.env
     environment:
-      - REDIS_HOST=redis
+    - REDIS_HOST=redis
+    - AUTO_CAPTURE=true
     cap_add:
       # Required for Scapy to actually open a raw capture socket.
       # Without these, real packet capture silently fails to bind --

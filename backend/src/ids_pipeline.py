@@ -179,14 +179,32 @@ class RealTimeIDSPipeline:
                 'first_seen': datetime.now(),
                 'last_seen': datetime.now(),
                 'protocol': protocol,
-                'packet_list': []
+                'packet_list': [],
+                # The first packet observed for this flow defines "forward".
+                # CICIDS2017's Fwd/Bwd split features are meaningless without
+                # this -- every packet from here on is tagged against it.
+                'init_src': src_ip,
+                'init_sport': src_port,
+                'init_dst': dst_ip,
+                'init_dport': dst_port,
+                'fwd_win': None,
+                'bwd_win': None,
             }
         
         flow = self.flow_tracker[flow_key]
         flow['packets'] += 1
         flow['bytes'] += len(packet)
         flow['last_seen'] = datetime.now()
-        flow['packet_list'].append(packet)
+
+        is_forward = (src_ip == flow['init_src'] and src_port == flow['init_sport'])
+        if TCP in packet:
+            win = int(packet[TCP].window)
+            if is_forward and flow['fwd_win'] is None:
+                flow['fwd_win'] = win
+            elif not is_forward and flow['bwd_win'] is None:
+                flow['bwd_win'] = win
+
+        flow['packet_list'].append((packet, is_forward))
         
         self.packet_buffer.append((flow_key, packet))
         
@@ -239,81 +257,215 @@ class RealTimeIDSPipeline:
             logger.error(f"Inference batch error: {e}")
     
     def _extract_flow_features(self, flow_key: Tuple) -> np.ndarray:
-        """Extract CICIDS2017-compatible features from a live flow[cite: 4]."""
+        """
+        Extract a real, correctly-ordered 78-feature CICIDS2017-compatible
+        vector from a live flow.
+
+        Column order matches feature_scaler.pkl's feature_names_in_ exactly
+        (verified against the fitted scaler at
+        backend/models/feature_scaler.pkl). Earlier versions of this method
+        computed ~24 generic stats and zero-padded the remaining 54 slots,
+        which silently misaligned every value with the wrong column and
+        guaranteed near-maximum reconstruction error on every flow,
+        regardless of whether the traffic was actually anomalous. That bug
+        is why live detections previously showed 100% anomaly score on
+        every single flow.
+
+        A handful of CICIDS2017 columns (Fwd/Bwd Avg Bulk Rate, Active/Idle
+        Mean/Std/Max/Min) require multi-flow bulk/idle-gap analysis that
+        isn't tracked by this lightweight per-flow buffer; those are left
+        at 0, which mirrors how CICIDS2017 itself encodes "not applicable"
+        for short flows. Everything else is computed directly from the
+        real captured packets.
+        """
         if flow_key not in self.flow_tracker:
             return None
 
         flow = self.flow_tracker[flow_key]
-        packets = flow['packet_list']
+        entries = flow['packet_list']
+        if not entries:
+            return None
+
+        fwd_pkts = [p for p, is_fwd in entries if is_fwd]
+        bwd_pkts = [p for p, is_fwd in entries if not is_fwd]
 
         flow_duration_s = (flow['last_seen'] - flow['first_seen']).total_seconds()
         flow_duration = flow_duration_s if flow_duration_s > 0 else 0.001
-        flow_duration_us = flow_duration * 1_000_000 
+        flow_duration_us = flow_duration * 1_000_000
 
-        num_packets = flow['packets']
+        total_fwd_packets = len(fwd_pkts)
+        total_bwd_packets = len(bwd_pkts)
+
+        fwd_lengths = np.array([len(p) for p in fwd_pkts], dtype=np.float64)
+        bwd_lengths = np.array([len(p) for p in bwd_pkts], dtype=np.float64)
+        all_lengths = np.array([len(p) for p, _ in entries], dtype=np.float64)
+
+        total_len_fwd = float(fwd_lengths.sum()) if len(fwd_lengths) else 0.0
+        total_len_bwd = float(bwd_lengths.sum()) if len(bwd_lengths) else 0.0
+
+        fwd_pkt_max = float(fwd_lengths.max()) if len(fwd_lengths) else 0.0
+        fwd_pkt_min = float(fwd_lengths.min()) if len(fwd_lengths) else 0.0
+        fwd_pkt_mean = float(fwd_lengths.mean()) if len(fwd_lengths) else 0.0
+        fwd_pkt_std = float(fwd_lengths.std()) if len(fwd_lengths) > 1 else 0.0
+
+        bwd_pkt_max = float(bwd_lengths.max()) if len(bwd_lengths) else 0.0
+        bwd_pkt_min = float(bwd_lengths.min()) if len(bwd_lengths) else 0.0
+        bwd_pkt_mean = float(bwd_lengths.mean()) if len(bwd_lengths) else 0.0
+        bwd_pkt_std = float(bwd_lengths.std()) if len(bwd_lengths) > 1 else 0.0
+
         total_bytes = flow['bytes']
-
-        pkt_sizes = np.array([len(p) for p in packets], dtype=np.float64)
-        pkt_size_mean = float(pkt_sizes.mean()) if len(pkt_sizes) else 0.0
-        pkt_size_std = float(pkt_sizes.std()) if len(pkt_sizes) > 1 else 0.0
-        pkt_size_max = float(pkt_sizes.max()) if len(pkt_sizes) else 0.0
-        pkt_size_min = float(pkt_sizes.min()) if len(pkt_sizes) else 0.0
-
-        if len(packets) > 1:
-            pkt_times = np.array(
-                [float(p.time) for p in packets], dtype=np.float64
-            )
-            iat = np.diff(pkt_times) * 1_000_000 
-            iat_mean = float(iat.mean())
-            iat_std = float(iat.std()) if len(iat) > 1 else 0.0
-            iat_max = float(iat.max())
-            iat_min = float(iat.min())
-        else:
-            iat_mean = iat_std = iat_max = iat_min = 0.0
-
-        syn_count = fin_count = rst_count = psh_count = ack_count = urg_count = 0
-        for p in packets:
-            if TCP in p:
-                f = p[TCP].flags
-                syn_count += int(f.S)
-                fin_count += int(f.F)
-                rst_count += int(f.R)
-                psh_count += int(f.P)
-                ack_count += int(f.A)
-                urg_count += int(f.U)
-
+        num_packets = flow['packets']
         flow_bytes_per_s = total_bytes / flow_duration if flow_duration > 0 else 0.0
         flow_packets_per_s = num_packets / flow_duration if flow_duration > 0 else 0.0
+        fwd_packets_per_s = total_fwd_packets / flow_duration if flow_duration > 0 else 0.0
+        bwd_packets_per_s = total_bwd_packets / flow_duration if flow_duration > 0 else 0.0
 
-        base_features = np.array([
-            flow_duration_us,
-            num_packets,
-            num_packets,            
-            0,                       
-            total_bytes,
-            total_bytes,             
-            0,                       
-            pkt_size_max,
-            pkt_size_min,
-            pkt_size_mean,
-            pkt_size_std,
-            flow_bytes_per_s,
-            flow_packets_per_s,
-            iat_mean,
-            iat_std,
-            iat_max,
-            iat_min,
-            syn_count,
-            fin_count,
-            rst_count,
-            psh_count,
-            ack_count,
-            urg_count,
-            1 if flow['protocol'] == 6 else 0,
+        def _iat_stats(pkts):
+            if len(pkts) < 2:
+                return 0.0, 0.0, 0.0, 0.0, 0.0
+            times = np.array([float(p.time) for p in pkts], dtype=np.float64)
+            times.sort()
+            iat = np.diff(times) * 1_000_000  # microseconds
+            return float(iat.sum()), float(iat.mean()), \
+                   (float(iat.std()) if len(iat) > 1 else 0.0), \
+                   float(iat.max()), float(iat.min())
+
+        all_pkts_only = [p for p, _ in entries]
+        _, flow_iat_mean, flow_iat_std, flow_iat_max, flow_iat_min = _iat_stats(all_pkts_only)
+        fwd_iat_total, fwd_iat_mean, fwd_iat_std, fwd_iat_max, fwd_iat_min = _iat_stats(fwd_pkts)
+        bwd_iat_total, bwd_iat_mean, bwd_iat_std, bwd_iat_max, bwd_iat_min = _iat_stats(bwd_pkts)
+
+        def _flag_counts(pkts):
+            c = dict(fin=0, syn=0, rst=0, psh=0, ack=0, urg=0, cwe=0, ece=0)
+            for p in pkts:
+                if TCP in p:
+                    f = p[TCP].flags
+                    c['fin'] += int(f.F)
+                    c['syn'] += int(f.S)
+                    c['rst'] += int(f.R)
+                    c['psh'] += int(f.P)
+                    c['ack'] += int(f.A)
+                    c['urg'] += int(f.U)
+                    c['cwe'] += int(getattr(f, 'C', 0) or 0)
+                    c['ece'] += int(getattr(f, 'E', 0) or 0)
+            return c
+
+        fwd_flags = _flag_counts(fwd_pkts)
+        bwd_flags = _flag_counts(bwd_pkts)
+        all_flags = _flag_counts(all_pkts_only)
+
+        def _ip_header_len(p):
+            # IP header length (4-byte words -> bytes) + TCP/UDP header length
+            ihl_bytes = int(p[IP].ihl) * 4 if hasattr(p[IP], 'ihl') and p[IP].ihl else 20
+            if TCP in p:
+                data_offset = int(p[TCP].dataofs) * 4 if p[TCP].dataofs else 20
+                return ihl_bytes + data_offset
+            if UDP in p:
+                return ihl_bytes + 8
+            return ihl_bytes
+
+        fwd_header_len = float(sum(_ip_header_len(p) for p in fwd_pkts))
+        bwd_header_len = float(sum(_ip_header_len(p) for p in bwd_pkts))
+
+        min_pkt_len = float(all_lengths.min()) if len(all_lengths) else 0.0
+        max_pkt_len = float(all_lengths.max()) if len(all_lengths) else 0.0
+        pkt_len_mean = float(all_lengths.mean()) if len(all_lengths) else 0.0
+        pkt_len_std = float(all_lengths.std()) if len(all_lengths) > 1 else 0.0
+        pkt_len_var = float(all_lengths.var()) if len(all_lengths) > 1 else 0.0
+
+        down_up_ratio = (total_bwd_packets / total_fwd_packets) if total_fwd_packets > 0 else 0.0
+        avg_pkt_size = float(all_lengths.mean()) if len(all_lengths) else 0.0
+        avg_fwd_segment_size = fwd_pkt_mean
+        avg_bwd_segment_size = bwd_pkt_mean
+
+        init_win_fwd = float(flow['fwd_win']) if flow['fwd_win'] is not None else -1.0
+        init_win_bwd = float(flow['bwd_win']) if flow['bwd_win'] is not None else -1.0
+        act_data_pkt_fwd = float(sum(1 for p in fwd_pkts if len(p) > _ip_header_len(p)))
+        min_seg_size_fwd = float(min((_ip_header_len(p) for p in fwd_pkts), default=0))
+
+        dst_port = flow['init_dport']
+
+        # Ordered to exactly match feature_scaler.pkl's feature_names_in_
+        features = np.array([
+            dst_port,                          # 0  Destination Port
+            flow_duration_us,                  # 1  Flow Duration
+            total_fwd_packets,                 # 2  Total Fwd Packets
+            total_bwd_packets,                 # 3  Total Backward Packets
+            total_len_fwd,                     # 4  Total Length of Fwd Packets
+            total_len_bwd,                     # 5  Total Length of Bwd Packets
+            fwd_pkt_max,                       # 6  Fwd Packet Length Max
+            fwd_pkt_min,                       # 7  Fwd Packet Length Min
+            fwd_pkt_mean,                      # 8  Fwd Packet Length Mean
+            fwd_pkt_std,                       # 9  Fwd Packet Length Std
+            bwd_pkt_max,                       # 10 Bwd Packet Length Max
+            bwd_pkt_min,                       # 11 Bwd Packet Length Min
+            bwd_pkt_mean,                      # 12 Bwd Packet Length Mean
+            bwd_pkt_std,                       # 13 Bwd Packet Length Std
+            flow_bytes_per_s,                  # 14 Flow Bytes/s
+            flow_packets_per_s,                # 15 Flow Packets/s
+            flow_iat_mean,                     # 16 Flow IAT Mean
+            flow_iat_std,                      # 17 Flow IAT Std
+            flow_iat_max,                      # 18 Flow IAT Max
+            flow_iat_min,                      # 19 Flow IAT Min
+            fwd_iat_total,                     # 20 Fwd IAT Total
+            fwd_iat_mean,                      # 21 Fwd IAT Mean
+            fwd_iat_std,                       # 22 Fwd IAT Std
+            fwd_iat_max,                       # 23 Fwd IAT Max
+            fwd_iat_min,                       # 24 Fwd IAT Min
+            bwd_iat_total,                     # 25 Bwd IAT Total
+            bwd_iat_mean,                      # 26 Bwd IAT Mean
+            bwd_iat_std,                       # 27 Bwd IAT Std
+            bwd_iat_max,                       # 28 Bwd IAT Max
+            bwd_iat_min,                       # 29 Bwd IAT Min
+            float(fwd_flags['psh']),           # 30 Fwd PSH Flags
+            float(bwd_flags['psh']),           # 31 Bwd PSH Flags
+            float(fwd_flags['urg']),           # 32 Fwd URG Flags
+            float(bwd_flags['urg']),           # 33 Bwd URG Flags
+            fwd_header_len,                    # 34 Fwd Header Length
+            bwd_header_len,                    # 35 Bwd Header Length
+            fwd_packets_per_s,                 # 36 Fwd Packets/s
+            bwd_packets_per_s,                 # 37 Bwd Packets/s
+            min_pkt_len,                       # 38 Min Packet Length
+            max_pkt_len,                       # 39 Max Packet Length
+            pkt_len_mean,                      # 40 Packet Length Mean
+            pkt_len_std,                       # 41 Packet Length Std
+            pkt_len_var,                       # 42 Packet Length Variance
+            float(all_flags['fin']),           # 43 FIN Flag Count
+            float(all_flags['syn']),           # 44 SYN Flag Count
+            float(all_flags['rst']),           # 45 RST Flag Count
+            float(all_flags['psh']),           # 46 PSH Flag Count
+            float(all_flags['ack']),           # 47 ACK Flag Count
+            float(all_flags['urg']),           # 48 URG Flag Count
+            float(all_flags['cwe']),           # 49 CWE Flag Count
+            float(all_flags['ece']),           # 50 ECE Flag Count
+            down_up_ratio,                     # 51 Down/Up Ratio
+            avg_pkt_size,                      # 52 Average Packet Size
+            avg_fwd_segment_size,              # 53 Avg Fwd Segment Size
+            avg_bwd_segment_size,              # 54 Avg Bwd Segment Size
+            fwd_header_len,                    # 55 Fwd Header Length.1 (CICIDS duplicates this column)
+            0.0,                               # 56 Fwd Avg Bytes/Bulk (not tracked — short live flows)
+            0.0,                               # 57 Fwd Avg Packets/Bulk
+            0.0,                               # 58 Fwd Avg Bulk Rate
+            0.0,                               # 59 Bwd Avg Bytes/Bulk
+            0.0,                               # 60 Bwd Avg Packets/Bulk
+            0.0,                               # 61 Bwd Avg Bulk Rate
+            total_fwd_packets,                 # 62 Subflow Fwd Packets
+            total_len_fwd,                     # 63 Subflow Fwd Bytes
+            total_bwd_packets,                 # 64 Subflow Bwd Packets
+            total_len_bwd,                     # 65 Subflow Bwd Bytes
+            init_win_fwd,                      # 66 Init_Win_bytes_forward
+            init_win_bwd,                      # 67 Init_Win_bytes_backward
+            act_data_pkt_fwd,                  # 68 act_data_pkt_fwd
+            min_seg_size_fwd,                  # 69 min_seg_size_forward
+            0.0,                               # 70 Active Mean (not tracked)
+            0.0,                               # 71 Active Std
+            0.0,                               # 72 Active Max
+            0.0,                               # 73 Active Min
+            0.0,                               # 74 Idle Mean
+            0.0,                               # 75 Idle Std
+            0.0,                               # 76 Idle Max
+            0.0,                               # 77 Idle Min
         ], dtype=np.float32)
-
-        features = np.zeros(78, dtype=np.float32)
-        features[:len(base_features)] = base_features
 
         return features
 
@@ -356,7 +508,7 @@ class RealTimeIDSPipeline:
                 'threat_type': 'Live Network Anomaly',
                 'severity': severity,
                 'src_ip': src_ip,
-                'dst_ip': flow_key[1][0],
+                'dst_ip': flow.get('init_dst', flow_key[1][0]),
                 'protocol': 'TCP' if flow['protocol'] == 6 else 'UDP',
                 'packet_count': flow['packets'],
                 'bytes_transferred': flow['bytes'],

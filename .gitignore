@@ -1,18 +1,44 @@
-# React / Node
+# --- Secrets — NEVER commit these ---
+backend/.env
+.env
+*.env
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.Python
+venv/
+env/
+.venv/
+
+# --- Node / React ---
 frontend/node_modules/
 frontend/build/
-.npm/
+npm-debug.log*
 
-# Python
-**/__pycache__/
-*.pyc
-backend/venv/
+# --- Docker ---
+# (nothing needed here — Dockerfile builds from source each time)
+
+# --- Logs ---
 backend/logs/
+*.log
 
-# Environment Variables & Secrets
-.env
-.env.local
+# --- Datasets & large generated artifacts ---
+# Keep these out of git; document how to regenerate them in your README instead.
+# Trained models can be large (.h5) — consider Git LFS or excluding entirely
+# and providing a download link / regeneration script in your thesis appendix.
+backend/data/preprocessed/*.csv
+backend/data/preprocessed/*.npy
+*.zip
+*.csv
+!backend/models/real_metrics.json
 
-# OS Files
+# --- OS / Editor cruft ---
 .DS_Store
 Thumbs.db
+.vscode/
+.idea/
+*.swp

@@ -1,5 +1,5 @@
 """
-STATUS: Scaffolded but not completed (see Thesis Chapter 7.4 / 8.2).
+STATUS: Scaffolded but not completed
 
 Manual verification confirmed the real end-to-end alert path (a
 constructed alert pushed to Redis correctly arrives at the React
