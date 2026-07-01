@@ -54,8 +54,15 @@ class RealTimeIDSPipeline:
     """
     Orchestrates real-time packet capture → feature extraction → AI inference → alerting[cite: 4].
     """
-    
-    def __init__(self, 
+
+    # Confidence-override fusion thresholds (see _process_prediction). A single
+    # model this confident overrides the 0.5/0.5 average so neither detector can
+    # fully veto the other: the AE can still raise novel attacks the RF misses,
+    # and the RF can still confirm known attacks the AE reconstructs well.
+    AE_OVERRIDE_CONF = 0.97   # autoencoder alone -> possible novel/unknown attack
+    RF_OVERRIDE_CONF = 0.90   # random forest alone -> high-confidence known attack
+
+    def __init__(self,
                  model_path: str,
                  feature_extractor_path: str,
                  alert_threshold: float = 0.75, 
@@ -75,16 +82,47 @@ class RealTimeIDSPipeline:
             self.redis_client = None
         
         try:
-            # Loading AI models for anomaly detection[cite: 4]
+            # Load the trained models. Live detection is a real two-model
+            # ensemble of complementary detectors:
+            #   - Autoencoder (unsupervised): reconstruction error flags traffic
+            #     unlike anything seen in benign training — catches UNKNOWN attacks.
+            #   - Random Forest (supervised, binary benign/attack): high-precision
+            #     recogniser of attack patterns it was trained on (F1 ~0.99).
+            # The CNN is intentionally NOT loaded here: it classifies over
+            # sequences of 100 consecutive flows (see sequence_builder.py), which
+            # only has meaning on the row-ordered CICIDS2017 CSV. Live per-flow
+            # capture provides no equivalent temporal window, so running the CNN
+            # live would feed it out-of-distribution input. It remains an offline
+            # evaluation model (see model_evaluation.py), documented as such.
             import tensorflow as tf
             from joblib import load
-            
-            self.ensemble_model = tf.keras.models.load_model(model_path, compile=False)
+
+            self.autoencoder = tf.keras.models.load_model(model_path, compile=False)
             self.feature_scaler = load(feature_extractor_path)
-            logger.info("Models loaded successfully")
+            logger.info("Autoencoder + feature scaler loaded successfully")
         except Exception as e:
             logger.error(f"Failed to load models: {e}")
             raise
+
+        # Supervised second opinion. Optional by design: if the RF can't be
+        # loaded (missing file, or a scikit-learn version skew that breaks the
+        # pickle), live detection degrades gracefully to autoencoder-only
+        # rather than crashing the whole capture pipeline.
+        self.random_forest = None
+        self._rf_attack_idx = None
+        try:
+            from joblib import load
+            rf_path = os.path.join(os.path.dirname(model_path), 'random_forest.pkl')
+            self.random_forest = load(rf_path)
+            # Resolve which predict_proba column is "attack" from classes_
+            # instead of hardcoding column 1 — this stays correct even if the
+            # RF is later retrained with more than two classes. Current model
+            # is binary: classes_ == [0, 1], 0=benign, 1=attack.
+            classes = list(self.random_forest.classes_)
+            self._rf_attack_idx = classes.index(1) if 1 in classes else len(classes) - 1
+            logger.info(f"Random Forest loaded (classes={classes}) — supervised cross-check enabled")
+        except Exception as e:
+            logger.warning(f"Random Forest not loaded ({e}); live detection will use the autoencoder alone")
 
         # The autoencoder's raw output is a *reconstructed feature vector*,
         # not a scalar score — "anomalous" means "poorly reconstructed", so
@@ -225,8 +263,15 @@ class RealTimeIDSPipeline:
         try:
             features_batch = []
             flow_keys_batch = []
-            
+
+            # Dedupe by flow: _extract_flow_features() computes over the whole
+            # flow, so scoring once per *packet* would re-score the same flow N
+            # times and emit N duplicate alerts. Score each unique flow once.
+            seen_flows = set()
             for flow_key, packet in batch:
+                if flow_key in seen_flows:
+                    continue
+                seen_flows.add(flow_key)
                 features = self._extract_flow_features(flow_key)
                 if features is not None:
                     features_batch.append(features)
@@ -238,7 +283,7 @@ class RealTimeIDSPipeline:
             features_array = np.array(features_batch)
             features_normalized = self.feature_scaler.transform(features_array)
             
-            reconstructed = self.ensemble_model.predict(
+            reconstructed = self.autoencoder.predict(
                 features_normalized,
                 batch_size=len(features_normalized),
                 verbose=0
@@ -250,8 +295,23 @@ class RealTimeIDSPipeline:
             # model saw during training on benign traffic.
             recon_errors = np.mean(np.square(features_normalized - reconstructed), axis=1)
 
-            for flow_key, recon_error in zip(flow_keys_batch, recon_errors):
-                self._process_prediction(flow_key, float(recon_error))
+            # Supervised cross-check: the Random Forest scores the exact same
+            # scaled 78-feature vectors and returns P(attack) per flow. Left as
+            # None per-flow when the RF is unavailable, so the ensemble falls
+            # back to autoencoder-only cleanly.
+            rf_attack_probs = [None] * len(flow_keys_batch)
+            if self.random_forest is not None:
+                try:
+                    proba = self.random_forest.predict_proba(features_normalized)
+                    rf_attack_probs = proba[:, self._rf_attack_idx]
+                except Exception as e:
+                    logger.warning(f"Random Forest inference failed this batch ({e}); using autoencoder only")
+
+            for flow_key, recon_error, rf_prob in zip(flow_keys_batch, recon_errors, rf_attack_probs):
+                self._process_prediction(
+                    flow_key, float(recon_error),
+                    None if rf_prob is None else float(rf_prob)
+                )
                 
         except Exception as e:
             logger.error(f"Inference batch error: {e}")
@@ -469,35 +529,78 @@ class RealTimeIDSPipeline:
 
         return features
 
-    def _process_prediction(self, flow_key, recon_error: float):
+    def _process_prediction(self, flow_key, recon_error: float, rf_attack_prob: float = None):
         """
         Processes a real reconstruction-error value and triggers alerts/IPS.
 
         recon_error is the raw MSE between a flow's scaled features and the
         autoencoder's reconstruction of them — unbounded and scale-dependent.
-        We convert it to a bounded (0,1) anomaly_score using the calibrated
+        We convert it to a bounded (0,1) autoencoder score using the calibrated
         threshold (self.recon_threshold, the benign-data error level above
         which traffic is considered anomalous): score = e / (e + threshold).
         At exactly the threshold this gives 0.5; well below it tends to 0;
         well above it saturates toward 1 — and it stays compatible with the
         Settings page's 0-1 Critical/High sliders without needing to assume
         a fixed scale for raw MSE.
+
+        FUSION — confidence-override (not a plain average). When the Random
+        Forest is available, the baseline score is the 0.5/0.5 average of the
+        autoencoder's unsupervised score and the RF's supervised P(attack).
+        BUT a highly-confident single model overrides that average:
+          * ae_score > AE_OVERRIDE_CONF  -> alert as a possible NOVEL attack.
+            This is essential: a plain average lets the RF veto the AE, which
+            would defeat the whole point of the unsupervised model (catching
+            attacks the supervised RF was never trained on). The SYN-flood case
+            in verify_ensemble.py demonstrated exactly this failure.
+          * rf_attack_prob > RF_OVERRIDE_CONF -> alert as a KNOWN attack the RF
+            recognises with high confidence, even if the AE reconstructs it well.
+        When an override fires, the reported anomaly_score is raised to the
+        triggering model's confidence so severity/labelling reflect why we
+        actually alerted, rather than the diluted average. All sub-scores are
+        recorded on the alert so the dashboard (and thesis) can show the reason.
         """
-        anomaly_score = recon_error / (recon_error + self.recon_threshold)
+        ae_score = recon_error / (recon_error + self.recon_threshold)
+
+        override_reason = None
+        if rf_attack_prob is not None:
+            fused_score = 0.5 * ae_score + 0.5 * rf_attack_prob
+            if ae_score > self.AE_OVERRIDE_CONF:
+                override_reason = 'autoencoder override (possible novel attack)'
+                anomaly_score = max(fused_score, ae_score)
+            elif rf_attack_prob > self.RF_OVERRIDE_CONF:
+                override_reason = 'random forest override (known attack pattern)'
+                anomaly_score = max(fused_score, rf_attack_prob)
+            else:
+                anomaly_score = fused_score
+        else:
+            # AE-only mode: the autoencoder score IS the anomaly score.
+            fused_score = ae_score
+            anomaly_score = ae_score
+
         flow = self.flow_tracker[flow_key]
-        src_ip = flow_key[0][0]
+        # Use the stored flow initiator, NOT flow_key[0][0]: flow_key is
+        # built with sorted([...]), so flow_key[0] is the lexicographically
+        # smaller endpoint, not the real source. Using it here would mislabel
+        # alerts and could auto-block the wrong IP (e.g. the victim/host).
+        src_ip = flow['init_src']
         settings = self._load_settings()
 
         # Whitelist protection to prevent blocking the host or router
         whitelist = ['192.168.18.1', '192.168.18.12']
 
         if flow['packets'] >= 2:
+            rf_str = 'n/a' if rf_attack_prob is None else f"{rf_attack_prob:.4f}"
+            ovr_str = f" OVERRIDE[{override_reason}]" if override_reason else ""
             logger.info(
                 f"DIAGNOSTIC recon_error={recon_error:.6f} threshold={self.recon_threshold:.6f} "
-                f"(calibrated={self._threshold_calibrated}) anomaly_score={anomaly_score:.4f} "
+                f"(calibrated={self._threshold_calibrated}) ae_score={ae_score:.4f} rf_prob={rf_str} "
+                f"fused={fused_score:.4f} anomaly_score={anomaly_score:.4f}{ovr_str} "
                 f"packets={flow['packets']} bytes={flow['bytes']} src={src_ip}"
             )
 
+        # Alert if the (possibly override-boosted) score clears the bar. The
+        # override_reason already boosted anomaly_score above, so this single
+        # gate covers both the averaged case and the single-model overrides.
         if anomaly_score > self.alert_threshold:
             severity = self._compute_severity(anomaly_score, settings)
             
@@ -505,6 +608,17 @@ class RealTimeIDSPipeline:
                 'timestamp': int(time.time()),
                 'flow_key': src_ip,
                 'anomaly_score': anomaly_score,
+                # Sub-scores kept for transparency: the unsupervised autoencoder
+                # score and the supervised RF P(attack). rf_attack_prob is null
+                # when the RF wasn't available and the ensemble ran AE-only.
+                'ae_anomaly_score': ae_score,
+                'rf_attack_prob': rf_attack_prob,
+                'fused_score': fused_score,
+                'detection_source': (
+                    override_reason if override_reason
+                    else 'ensemble (autoencoder + random forest)'
+                    if rf_attack_prob is not None else 'autoencoder only'
+                ),
                 'threat_type': 'Live Network Anomaly',
                 'severity': severity,
                 'src_ip': src_ip,
@@ -532,12 +646,15 @@ class RealTimeIDSPipeline:
                 except Exception as e:
                     logger.error(f"Failed to block IP: {e}")
 
-    def _classify_threat(self, threat_probs: np.ndarray) -> str:
-        threat_classes = ['Benign', 'DoS', 'Port Scan', 'Brute Force', 'Web Attack']
-        if len(threat_probs) == 0:
-            return 'Unknown'
-        return threat_classes[np.argmax(threat_probs)]
-    
+    # NOTE: a previous _classify_threat() here mapped model output to five
+    # named attack classes (DoS/Port Scan/Brute Force/Web Attack). It was dead
+    # code AND misleading: the deployed Random Forest is binary (benign/attack,
+    # classes_ == [0, 1]), so it cannot name an attack subtype. Multi-class
+    # threat typing would require retraining the RF/CNN on CICIDS2017's original
+    # per-attack labels (they are currently collapsed to 0/1 in
+    # data_preprocessing.py). Removed rather than left in to avoid implying a
+    # capability the model doesn't have. See thesis "Future Work".
+
     def _compute_severity(self, anomaly_score: float, settings: dict = None) -> str:
         """
         Severity bands are driven by the Critical/High thresholds saved on

@@ -1,7 +1,12 @@
-numpy>=1.21.0
-pandas>=1.3.0
-scikit-learn>=1.0.0
-tensorflow
+# Pinned as a coherent numpy-2 stack. These four must move together:
+# TensorFlow 2.18+ requires numpy>=2, and pandas>=2.2 / scikit-learn>=1.5
+# are the versions built against numpy 2. Mixing a numpy-1 pandas with a
+# numpy-2 TensorFlow causes an ABI DLL-load failure (verified during setup).
+# scikit-learn>=1.5 is also required to unpickle the trained random_forest.pkl.
+numpy>=2.0,<2.3
+pandas>=2.2
+scikit-learn>=1.5,<1.6
+tensorflow>=2.18
 scapy>=2.4.5
 redis>=4.1.0
 Flask>=2.0.0
