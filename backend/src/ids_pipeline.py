@@ -65,11 +65,25 @@ class RealTimeIDSPipeline:
     def __init__(self,
                  model_path: str,
                  feature_extractor_path: str,
-                 alert_threshold: float = 0.75, 
-                 packet_batch_size: int = 100):
+                 alert_threshold: float = 0.75,
+                 packet_batch_size: int = 100,
+                 flow_idle_timeout: float = 120.0,
+                 max_tracked_flows: int = 20000):
         self.model_path = model_path
         self.alert_threshold = alert_threshold
         self.packet_batch_size = packet_batch_size
+        # Flow-table eviction bounds. Without these, flow_tracker grows for
+        # the lifetime of the capture (a real memory leak on a long-running
+        # sensor) and stale flows keep re-scoring with ever-growing stats.
+        #   - flow_idle_timeout: seconds since last packet before a flow is
+        #     considered finished and dropped.
+        #   - max_tracked_flows: hard cap; if exceeded, the oldest (by
+        #     last_seen) flows are evicted first — a safety net against
+        #     high-cardinality floods (e.g. spoofed-source DDoS/port scans)
+        #     that create huge numbers of one-packet flows.
+        self.flow_idle_timeout = flow_idle_timeout
+        self.max_tracked_flows = max_tracked_flows
+        self._last_eviction_at = 0.0
         
         try:
             # Redis connection logic for alert persistence[cite: 4]
@@ -222,7 +236,52 @@ class RealTimeIDSPipeline:
                 logger.debug(f"Could not refresh live settings: {e}")
             self._settings_loaded_at = now
         return self._settings_cache
-        
+
+    def _evict_stale_flows(self):
+        """
+        Drop finished/stale flows so flow_tracker stays bounded.
+
+        Two independent bounds (see __init__):
+          1. Idle timeout — any flow whose last packet is older than
+             flow_idle_timeout is removed. This is the normal path: short-lived
+             connections finish and age out.
+          2. Hard cap — if the table still exceeds max_tracked_flows after the
+             idle sweep (e.g. a burst of tens of thousands of one-packet flows
+             from a spoofed-source flood), evict the oldest flows by last_seen
+             until back under the cap. Bounds memory even under active attack.
+
+        Cheap and safe to call once per inference batch; it only walks the
+        table, and the common case (nothing stale) is a fast scan.
+        """
+        now = datetime.now()
+        # 1. Idle-timeout sweep
+        stale = [
+            k for k, f in self.flow_tracker.items()
+            if (now - f['last_seen']).total_seconds() > self.flow_idle_timeout
+        ]
+        for k in stale:
+            del self.flow_tracker[k]
+
+        # 2. Hard-cap safety net
+        overflow = len(self.flow_tracker) - self.max_tracked_flows
+        if overflow > 0:
+            # Oldest-first by last_seen; evict just enough to get under the cap.
+            oldest = sorted(
+                self.flow_tracker.items(), key=lambda kv: kv[1]['last_seen']
+            )[:overflow]
+            for k, _ in oldest:
+                del self.flow_tracker[k]
+            logger.warning(
+                f"flow_tracker hit max_tracked_flows ({self.max_tracked_flows}); "
+                f"evicted {overflow} oldest flows (possible high-cardinality flood)."
+            )
+
+        if stale or overflow > 0:
+            logger.debug(
+                f"Flow eviction: dropped {len(stale)} idle + "
+                f"{max(overflow, 0)} over-cap; {len(self.flow_tracker)} flows tracked."
+            )
+
     def packet_callback(self, packet):
         """Scapy callback for each captured packet[cite: 4]."""
         if not (IP in packet):
@@ -348,10 +407,15 @@ class RealTimeIDSPipeline:
                     flow_key, float(recon_error),
                     None if rf_prob is None else float(rf_prob)
                 )
-                
+
         except Exception as e:
             logger.error(f"Inference batch error: {e}")
-    
+        finally:
+            # Reclaim finished/stale flows every batch so the table stays
+            # bounded even under a long capture or a high-cardinality flood.
+            # In finally so eviction still runs if scoring raised above.
+            self._evict_stale_flows()
+
     def _extract_flow_features(self, flow_key: Tuple) -> np.ndarray:
         """
         Extract a real, correctly-ordered 78-feature CICIDS2017-compatible

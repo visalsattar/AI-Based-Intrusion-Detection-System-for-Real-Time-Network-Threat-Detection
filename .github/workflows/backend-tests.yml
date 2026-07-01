@@ -1,0 +1,46 @@
+name: Backend Tests
+
+# Runs the IDS backend pytest suite (preprocessing, sequence-builder
+# leakage checks, and live-inference/ensemble tests) on every push and PR.
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "backend/**"
+      - ".github/workflows/backend-tests.yml"
+  pull_request:
+    paths:
+      - "backend/**"
+      - ".github/workflows/backend-tests.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        working-directory: backend
+        # The pinned numpy-2 stack in requirements.txt is what the models were
+        # re-saved against; installing it here is also a real smoke test that
+        # the dependency set resolves cleanly on a clean machine.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run test suite
+        working-directory: backend
+        # -p no:warnings keeps the log readable (TF/sklearn are noisy). The
+        # inference tests auto-skip if model artifacts are missing, but they
+        # are committed under backend/models, so they run for real here.
+        run: |
+          python -m pytest tests/ -v -p no:warnings

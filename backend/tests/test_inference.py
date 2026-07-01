@@ -106,6 +106,49 @@ def test_feature_vector_is_78_and_scaler_aligned(pipeline):
     assert np.isfinite(features).all(), "feature vector contains NaN/Inf"
 
 
+def test_idle_flows_are_evicted(pipeline):
+    """A flow whose last packet is older than flow_idle_timeout is dropped."""
+    from datetime import datetime, timedelta
+
+    flow_key = _make_flow(pipeline)
+    # Backdate last_seen well past the timeout.
+    pipeline.flow_tracker[flow_key]["last_seen"] = (
+        datetime.now() - timedelta(seconds=pipeline.flow_idle_timeout + 10)
+    )
+    pipeline._evict_stale_flows()
+    assert flow_key not in pipeline.flow_tracker, "stale flow was not evicted"
+
+
+def test_hard_cap_evicts_oldest_flows(pipeline):
+    """When over max_tracked_flows, the oldest flows are evicted first."""
+    from datetime import datetime, timedelta
+
+    original_cap = pipeline.max_tracked_flows
+    pipeline.flow_tracker.clear()
+    pipeline.max_tracked_flows = 5
+    try:
+        now = datetime.now()
+        # 8 fresh flows (none idle) so only the hard cap can act.
+        for i in range(8):
+            key = (("10.0.0.%d" % i, 1000 + i), ("10.0.0.254", 80), 6)
+            pipeline.flow_tracker[key] = {
+                "packets": 1, "bytes": 40,
+                "first_seen": now, "last_seen": now - timedelta(seconds=i),
+                "protocol": 6, "packet_list": [],
+                "init_src": "10.0.0.%d" % i, "init_sport": 1000 + i,
+                "init_dst": "10.0.0.254", "init_dport": 80,
+                "fwd_win": None, "bwd_win": None,
+            }
+        pipeline._evict_stale_flows()
+        assert len(pipeline.flow_tracker) == 5, "table not trimmed to cap"
+        # The three oldest (largest i -> older last_seen) should be gone.
+        remaining_srcs = {f["init_src"] for f in pipeline.flow_tracker.values()}
+        assert "10.0.0.7" not in remaining_srcs and "10.0.0.5" not in remaining_srcs
+    finally:
+        pipeline.max_tracked_flows = original_cap
+        pipeline.flow_tracker.clear()
+
+
 def test_override_confs_fall_back_to_defaults(pipeline):
     """
     With no override_calibration.json present, the pipeline must use the coded
