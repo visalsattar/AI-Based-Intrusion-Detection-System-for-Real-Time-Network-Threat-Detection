@@ -106,6 +106,18 @@ def test_feature_vector_is_78_and_scaler_aligned(pipeline):
     assert np.isfinite(features).all(), "feature vector contains NaN/Inf"
 
 
+def test_override_confs_fall_back_to_defaults(pipeline):
+    """
+    With no override_calibration.json present, the pipeline must use the coded
+    class defaults (AE 0.97 / RF 0.90). calibrate_override.py can later write
+    that file to tighten these from real benign data.
+    """
+    cal = os.path.join(BACKEND_DIR, "models", "override_calibration.json")
+    if not os.path.exists(cal):
+        assert pipeline.AE_OVERRIDE_CONF == pytest.approx(0.97)
+        assert pipeline.RF_OVERRIDE_CONF == pytest.approx(0.90)
+
+
 def test_severity_bands(pipeline):
     """Severity must respect the default Critical=0.95 / High=0.85 thresholds."""
     assert pipeline._compute_severity(0.97) == "CRITICAL"

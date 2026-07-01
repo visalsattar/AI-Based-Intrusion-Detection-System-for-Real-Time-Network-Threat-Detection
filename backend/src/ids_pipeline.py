@@ -134,6 +134,13 @@ class RealTimeIDSPipeline:
         # fallback — logged loudly rather than silently guessed.
         self.recon_threshold, self._threshold_calibrated = self._load_recon_threshold(model_path)
 
+        # Override thresholds: use benign-calibrated values when
+        # `python src/calibrate_override.py` has produced
+        # models/override_calibration.json, otherwise fall back to the coded
+        # class defaults (AE_OVERRIDE_CONF / RF_OVERRIDE_CONF). Set as instance
+        # attributes so they shadow the class defaults when present.
+        self.AE_OVERRIDE_CONF, self.RF_OVERRIDE_CONF = self._load_override_confs(model_path)
+
         self.packet_buffer = []
         self.flow_tracker = {}
         self._settings_cache = {}
@@ -168,6 +175,35 @@ class RealTimeIDSPipeline:
             f"to generate real_metrics.json from your real training data."
         )
         return fallback, False
+
+    @classmethod
+    def _load_override_confs(cls, model_path: str):
+        """
+        Reads benign-calibrated override thresholds produced by
+        `python src/calibrate_override.py`, from models/override_calibration.json.
+        Returns (ae_override, rf_override). Falls back to the class defaults
+        (AE_OVERRIDE_CONF / RF_OVERRIDE_CONF) when the file is absent or a value
+        is missing — so the system runs with sensible defaults out of the box
+        and simply tightens up once real calibration is available.
+        """
+        ae, rf = cls.AE_OVERRIDE_CONF, cls.RF_OVERRIDE_CONF
+        path = os.path.join(os.path.dirname(model_path), 'override_calibration.json')
+        try:
+            with open(path) as f:
+                cal = json.load(f)
+            if cal.get('ae_override') is not None:
+                ae = float(cal['ae_override'])
+            if cal.get('rf_override') is not None:
+                rf = float(cal['rf_override'])
+            logger.info(f"Loaded benign-calibrated override thresholds "
+                        f"(ae={ae:.4f}, rf={rf:.4f}) from {path}")
+        except FileNotFoundError:
+            logger.info(f"No override_calibration.json — using coded override "
+                        f"defaults (ae={ae:.2f}, rf={rf:.2f}). Run "
+                        f"src/calibrate_override.py to derive them from benign data.")
+        except Exception as e:
+            logger.warning(f"Could not parse {path}: {e}; using coded override defaults")
+        return ae, rf
 
     def _load_settings(self) -> dict:
         """
