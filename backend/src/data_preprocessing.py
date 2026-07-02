@@ -12,9 +12,21 @@ logger = logging.getLogger(__name__)
 
 class CICIDSPreprocessor:
     """
-    Handles CICIDS2017 & UNSW-NB15 dataset preprocessing
+    Handles CICIDS2017 & UNSW-NB15 dataset preprocessing.
+
+    Binary mode (default, backward-compatible):
+        BENIGN → 0, every attack type → 1.
+        All existing trained models expect this encoding.
+
+    Multi-class mode (--multiclass flag in main.py):
+        BENIGN → 0, each distinct attack label → a unique integer in
+        alphabetical order (e.g. Bot→1, DDoS→2, DoS Hulk→3 ...).
+        A models/label_map.json is written alongside the preprocessed CSV
+        so the live pipeline can translate integer predictions back to
+        human-readable names ("DDoS", "Port Scan", etc.) in dashboard alerts.
+        To activate, retrain with `python main.py --mode train --multiclass`.
     """
-    
+
     CICIDS_FEATURE_COLS = [
         'Dst Port', 'Protocol', 'Timestamp', 'Flow Duration',
         'Total Fwd Packets', 'Total Backward Packets', 
@@ -135,35 +147,86 @@ class CICIDSPreprocessor:
         
         return df
     
-    def preprocess_pipeline(self, file_path: str, output_path: str = None) -> pd.DataFrame:
+    def preprocess_pipeline(self, file_path: str, output_path: str = None,
+                             multiclass: bool = False,
+                             label_map_path: str = None) -> pd.DataFrame:
+        """
+        Full preprocessing pipeline.
+
+        multiclass: when False (default), BENIGN→0 and all attacks→1
+                    (backward-compatible with existing trained models).
+                    When True, each distinct attack label gets its own
+                    integer (BENIGN always=0; others sorted alphabetically),
+                    and a label_map.json is written so the live pipeline can
+                    name attack types in dashboard alerts.
+        label_map_path: where to write label_map.json in multiclass mode.
+                    Defaults to models/label_map.json relative to the
+                    preprocessed CSV, so main.py training flow auto-finds it.
+        """
         logger.info("\n" + "="*70)
-        logger.info("STARTING PREPROCESSING PIPELINE")
+        logger.info(f"STARTING PREPROCESSING PIPELINE (multiclass={multiclass})")
         logger.info("="*70)
-        
+
         df = self.load_dataset(file_path)
         df = self.handle_infinite_values(df)
         df = self.handle_missing_values(df, strategy='mean')
-        
-        # Standardize column names and encode labels:
-        # 1. Remove hidden spaces from column names (turns ' Label' into 'Label')
+
+        # 1. Strip hidden spaces from column names (' Label' → 'Label')
         df.columns = df.columns.str.strip()
-        
-        # 2. Convert strings to numbers (0=Safe, 1=Attack)
+
+        # 2. Encode labels
+        label_map = None
         if 'Label' in df.columns:
-            df['Label'] = df['Label'].apply(lambda x: 0 if x == 'BENIGN' else 1)
-            
-        # 3. Drop any remaining text columns (like IP addresses) so math doesn't crash
+            if multiclass:
+                # Map each unique attack type to its own integer.
+                # BENIGN is always 0; all others are sorted alphabetically
+                # so the mapping is deterministic across runs and machines.
+                attack_labels = sorted(
+                    lbl for lbl in df['Label'].unique() if lbl != 'BENIGN'
+                )
+                label_map = {0: 'Benign'}
+                for i, lbl in enumerate(attack_labels, start=1):
+                    label_map[i] = lbl
+                reverse = {'BENIGN': 0}
+                reverse.update({lbl: i for i, lbl in label_map.items() if i > 0})
+                df['Label'] = df['Label'].map(reverse).fillna(0).astype(int)
+                logger.info(
+                    f"Multi-class label encoding: {len(label_map)} classes — "
+                    + ", ".join(f"{k}={v}" for k, v in label_map.items())
+                )
+            else:
+                # Binary (default): BENIGN=0, any attack=1
+                df['Label'] = df['Label'].apply(lambda x: 0 if x == 'BENIGN' else 1)
+                logger.info("Binary label encoding: BENIGN=0, all attacks=1")
+
+        # 3. Drop remaining text columns (IP addresses etc.) so math doesn't crash
         df = df.select_dtypes(exclude=['object'])
 
         df = self.normalize_features(df, fit=True)
         df = self.encode_labels(df, fit=True)
-        
+
         if output_path:
             df.to_csv(output_path, index=False)
             logger.info(f"Saved preprocessed dataset to {output_path}")
-        
+
+        # Write label_map.json in multi-class mode so the pipeline can
+        # translate RF integer predictions to named attack types at runtime.
+        if multiclass and label_map is not None:
+            import json, os
+            if label_map_path is None:
+                base = os.path.dirname(output_path) if output_path else '.'
+                label_map_path = os.path.join(
+                    os.path.dirname(base), 'models', 'label_map.json'
+                )
+            os.makedirs(os.path.dirname(label_map_path) or '.', exist_ok=True)
+            # JSON keys must be strings; store as {"0":"Benign","1":"DDoS",...}
+            with open(label_map_path, 'w') as f:
+                json.dump({str(k): v for k, v in label_map.items()}, f, indent=2)
+            logger.info(f"Saved multi-class label map to {label_map_path}")
+            self.label_map = label_map  # expose for callers / tests
+
         logger.info("\n" + "="*70)
         logger.info("PREPROCESSING COMPLETE")
         logger.info("="*70 + "\n")
-        
+
         return df

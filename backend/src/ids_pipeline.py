@@ -124,19 +124,41 @@ class RealTimeIDSPipeline:
         # rather than crashing the whole capture pipeline.
         self.random_forest = None
         self._rf_attack_idx = None
+        self._rf_multiclass = False
         try:
             from joblib import load
             rf_path = os.path.join(os.path.dirname(model_path), 'random_forest.pkl')
             self.random_forest = load(rf_path)
-            # Resolve which predict_proba column is "attack" from classes_
-            # instead of hardcoding column 1 — this stays correct even if the
-            # RF is later retrained with more than two classes. Current model
-            # is binary: classes_ == [0, 1], 0=benign, 1=attack.
             classes = list(self.random_forest.classes_)
             self._rf_attack_idx = classes.index(1) if 1 in classes else len(classes) - 1
-            logger.info(f"Random Forest loaded (classes={classes}) — supervised cross-check enabled")
+            # Multi-class RF (retrained with --multiclass) has more than the
+            # binary [0, 1] class set. When present it can name the attack type
+            # (DDoS, Port Scan, etc.) rather than just "attack" — loaded from
+            # label_map.json written by preprocess_pipeline(multiclass=True).
+            self._rf_multiclass = len(classes) > 2
+            mode = "multi-class" if self._rf_multiclass else "binary"
+            logger.info(f"Random Forest loaded ({mode}, classes={classes}) — supervised cross-check enabled")
         except Exception as e:
             logger.warning(f"Random Forest not loaded ({e}); live detection will use the autoencoder alone")
+
+        # Attack-type label map: {"0":"Benign","1":"DDoS","2":"Port Scan",...}
+        # Written by data_preprocessing.preprocess_pipeline(multiclass=True).
+        # When absent (binary RF or no retraining yet) falls back to a generic
+        # label so the pipeline runs identically to the previous binary mode.
+        self._label_map = {}
+        label_map_path = os.path.join(os.path.dirname(model_path), 'label_map.json')
+        try:
+            with open(label_map_path) as f:
+                self._label_map = {int(k): v for k, v in json.load(f).items()}
+            logger.info(f"Loaded {len(self._label_map)}-class label map from {label_map_path}: "
+                        + ", ".join(f"{k}={v}" for k, v in sorted(self._label_map.items())))
+        except FileNotFoundError:
+            if self._rf_multiclass:
+                logger.warning(f"Multi-class RF loaded but no label_map.json at {label_map_path}; "
+                                "threat names will fall back to class integers. Re-run preprocessing "
+                                "with --multiclass to regenerate the map.")
+        except Exception as e:
+            logger.warning(f"Could not load label map ({e}); threat names will be generic")
 
         # The autoencoder's raw output is a *reconstructed feature vector*,
         # not a scalar score — "anomalous" means "poorly reconstructed", so
@@ -395,17 +417,32 @@ class RealTimeIDSPipeline:
             # None per-flow when the RF is unavailable, so the ensemble falls
             # back to autoencoder-only cleanly.
             rf_attack_probs = [None] * len(flow_keys_batch)
+            # threat_names: string label per flow from the multi-class RF
+            # ("DDoS", "Port Scan" etc.) or None when binary/unavailable.
+            threat_names = [None] * len(flow_keys_batch)
             if self.random_forest is not None:
                 try:
                     proba = self.random_forest.predict_proba(features_normalized)
                     rf_attack_probs = proba[:, self._rf_attack_idx]
+                    if self._rf_multiclass:
+                        # predict() gives the highest-probability class per flow.
+                        # Translate integer class IDs to human-readable names via
+                        # the label_map loaded at startup; fall back to the raw
+                        # integer string if the map doesn't cover that class.
+                        preds = self.random_forest.predict(features_normalized)
+                        threat_names = [
+                            self._label_map.get(int(p), f"Class {p}") for p in preds
+                        ]
                 except Exception as e:
                     logger.warning(f"Random Forest inference failed this batch ({e}); using autoencoder only")
 
-            for flow_key, recon_error, rf_prob in zip(flow_keys_batch, recon_errors, rf_attack_probs):
+            for flow_key, recon_error, rf_prob, threat_name in zip(
+                flow_keys_batch, recon_errors, rf_attack_probs, threat_names
+            ):
                 self._process_prediction(
                     flow_key, float(recon_error),
-                    None if rf_prob is None else float(rf_prob)
+                    None if rf_prob is None else float(rf_prob),
+                    threat_name,
                 )
 
         except Exception as e:
@@ -629,7 +666,9 @@ class RealTimeIDSPipeline:
 
         return features
 
-    def _process_prediction(self, flow_key, recon_error: float, rf_attack_prob: float = None):
+    def _process_prediction(self, flow_key, recon_error: float,
+                            rf_attack_prob: float = None,
+                            threat_name: str = None):
         """
         Processes a real reconstruction-error value and triggers alerts/IPS.
 
@@ -719,7 +758,11 @@ class RealTimeIDSPipeline:
                     else 'ensemble (autoencoder + random forest)'
                     if rf_attack_prob is not None else 'autoencoder only'
                 ),
-                'threat_type': 'Live Network Anomaly',
+                # threat_name is set by a multi-class RF and names the
+                # attack category ("DDoS", "Port Scan", etc.).  Falls back
+                # to a generic label when the RF is binary or unavailable.
+                'threat_type': threat_name if threat_name and threat_name != 'Benign'
+                               else 'Network Anomaly',
                 'severity': severity,
                 'src_ip': src_ip,
                 'dst_ip': flow.get('init_dst', flow_key[1][0]),
