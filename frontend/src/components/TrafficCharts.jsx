@@ -94,14 +94,23 @@ export const NetworkTrafficChart = ({ alerts = [] }) => {
       const ms = typeof a.timestamp === 'number' ? a.timestamp * 1000 : a.timestamp;
       const date = new Date(ms);
       if (isNaN(date.getTime())) return;
-      // Bucket by minute so a burst of alerts reads as a real spike
-      const key = `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+      // Bucket by 10-second windows rather than full minutes. Short live
+      // capture sessions (the common case when testing AUTO_CAPTURE for a
+      // few minutes) generate many alerts within the same single minute,
+      // which previously collapsed them all into one bucket -- the chart
+      // rendered a single static point instead of a visibly moving line.
+      // 10s windows give a real trend even on short test runs while still
+      // reading sensibly over longer sessions (the 60-bucket cap below
+      // covers the most recent 10 minutes).
+      const bucketMs = Math.floor(date.getTime() / 10000) * 10000;
+      const bucketDate = new Date(bucketMs);
+      const key = `${String(bucketDate.getHours()).padStart(2, '0')}:${String(bucketDate.getMinutes()).padStart(2, '0')}:${String(bucketDate.getSeconds()).padStart(2, '0')}`;
       buckets[key] = (buckets[key] || 0) + 1;
     });
     return Object.entries(buckets)
       .map(([time, count]) => ({ time, count }))
       .sort((a, b) => a.time.localeCompare(b.time))
-      .slice(-30); // last 30 minute-buckets
+      .slice(-60); // last 60 buckets (~10 minutes at 10s resolution)
   }, [alerts]);
 
   return (

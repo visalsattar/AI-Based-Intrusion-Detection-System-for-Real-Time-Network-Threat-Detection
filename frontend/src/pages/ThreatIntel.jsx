@@ -12,6 +12,10 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import axios from 'axios';
 import { RefreshCw, Database } from 'lucide-react';
+import { MapContainer, TileLayer, CircleMarker, Popup } from 'react-leaflet';
+import 'leaflet/dist/leaflet.css';
+
+const SEVERITY_COLOR = { CRITICAL: '#EF4444', HIGH: '#F59E0B', MEDIUM: '#38BDF8' };
 
 const formatTimestamp = (ts) => {
   if (!ts) return '—';
@@ -68,6 +72,8 @@ const ThreatIntel = () => {
 
   if (loading) return <div className="page-placeholder">Loading threat intelligence…</div>;
 
+  const mappable = records.filter(r => r.location?.lat != null && r.location?.lon != null);
+
   return (
     <div className="page">
       <header className="page-header">
@@ -92,6 +98,45 @@ const ThreatIntel = () => {
           <span className={`value ${geoDb?.available ? 'ok' : 'warn'}`}>
             {geoDb?.available ? geoDb.message : (geoDb?.message || 'Unknown')}
           </span>
+        </div>
+      </div>
+
+      <div className="intel-map-card">
+        <h3>Threat Origins</h3>
+        <div className="intel-map-container" style={{ height: 280 }}>
+          <MapContainer center={[20, 10]} zoom={1.5} minZoom={1.5} worldCopyJump
+            style={{ height: '100%', width: '100%', background: '#0B0E14' }}>
+            <TileLayer
+              url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
+              attribution='&copy; <a href="https://carto.com/attributions">CARTO</a>'
+            />
+            {mappable.map((r) => (
+              <CircleMarker
+                key={r.ip}
+                center={[r.location.lat, r.location.lon]}
+                radius={6}
+                pathOptions={{
+                  color: SEVERITY_COLOR[r.severity] || '#38BDF8',
+                  fillColor: SEVERITY_COLOR[r.severity] || '#38BDF8',
+                  fillOpacity: 0.6, weight: 1.5,
+                }}
+              >
+                <Popup>
+                  <div className="intel-marker-popup">
+                    <strong>{r.ip}</strong><br />
+                    {r.location.label}<br />
+                    {r.hits} hit{r.hits === 1 ? '' : 's'} · {r.severity}
+                  </div>
+                </Popup>
+              </CircleMarker>
+            ))}
+          </MapContainer>
+          {mappable.length === 0 && records.length > 0 && (
+            <p className="page-subtext" style={{ marginTop: 8 }}>
+              No mappable public IPs yet — current source IPs are private/internal
+              addresses, which have no real-world geolocation.
+            </p>
+          )}
         </div>
       </div>
 
