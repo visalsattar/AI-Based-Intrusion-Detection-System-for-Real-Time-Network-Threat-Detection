@@ -67,7 +67,7 @@ from routes import register_routes
 
 # 6. Global Application Initialization
 # Initialize Flask using the absolute path to the React frontend
-app = Flask(__name__, static_folder=FRONTEND_DIR, static_url_path='/')
+app = Flask(__name__, static_folder=FRONTEND_DIR, static_url_path=None)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-key')
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 

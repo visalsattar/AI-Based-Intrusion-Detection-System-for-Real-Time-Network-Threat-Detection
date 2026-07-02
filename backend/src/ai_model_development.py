@@ -150,9 +150,16 @@ class HybridIDSModel:
         
         self.random_forest.fit(X_train, y_train)
         
+        # n_jobs=1 (not -1): on Windows, joblib spawns child processes that
+        # re-import the parent module. When training is launched via main.py,
+        # that re-import loads Flask, SocketIO, Scapy, and Redis globals in
+        # each worker, which deadlocks silently. n_jobs=1 avoids spawning and
+        # is always safe. The RF .fit() above already used n_jobs=-1 (in the
+        # RandomForestClassifier constructor) for the actual tree building, so
+        # overall training speed is unaffected.
         cv_scores = cross_val_score(
             self.random_forest, X_train, y_train,
-            cv=5, scoring='f1_weighted', n_jobs=-1
+            cv=5, scoring='f1_weighted', n_jobs=1
         )
         
         logger.info(f"RF CV F1 Scores: mean={cv_scores.mean():.4f} ± {cv_scores.std():.4f}")

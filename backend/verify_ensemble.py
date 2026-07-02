@@ -140,8 +140,12 @@ def main():
             "init_dst": "10.0.0.1", "init_dport": 80,
             "fwd_win": 0, "bwd_win": 0,
         }
-        # Scale the features the same way the live batch does.
-        scaled = pipeline.feature_scaler.transform(ddos_row.reshape(1, -1))
+        # The cleaned CSV is already MinMax-scaled; do NOT apply
+        # feature_scaler.transform() here (the scaler was fitted on raw
+        # Scapy-extracted values, so applying it to [0,1] data would
+        # double-scale and push all values near 0, causing the RF to
+        # misclassify everything as Benign).
+        scaled = ddos_row.reshape(1, -1)
         # Get RF class name directly.
         pred_class = int(pipeline.random_forest.predict(scaled)[0])
         rf_prob    = float(pipeline.random_forest.predict_proba(scaled)[0, pipeline._rf_attack_idx])
