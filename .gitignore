@@ -15,7 +15,8 @@ env/
 .venv/
 
 # --- Node / React ---
-frontend/node_modules/
+node_modules/          # Catches the accidental root node_modules
+frontend/node_modules/ # Catches the frontend node_modules
 frontend/build/
 npm-debug.log*
 
@@ -28,12 +29,17 @@ backend/logs/
 
 # --- Datasets & large generated artifacts ---
 # Keep these out of git; document how to regenerate them in your README instead.
-# Trained models can be large (.h5) — consider Git LFS or excluding entirely
-# and providing a download link / regeneration script in your thesis appendix.
 backend/data/preprocessed/*.csv
 backend/data/preprocessed/*.npy
 *.zip
 *.csv
+
+# --- AI Models & Scalers (CRITICAL) ---
+backend/models/*.h5
+backend/models/*.pkl
+
+# --- Metrics ---
+# If you want to ignore this file, remove the ! at the start.
 !backend/models/real_metrics.json
 
 # --- OS / Editor cruft ---
