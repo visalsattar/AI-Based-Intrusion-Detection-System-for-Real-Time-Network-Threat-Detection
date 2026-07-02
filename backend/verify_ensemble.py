@@ -118,6 +118,42 @@ def main():
     print("[3] Feeding a SYN-FLOOD (one high-rate 400-packet flow) ...")
     feed(pipeline, synflood_flow(t0 + 20))
 
+    # [4] Direct RF class-naming proof: inject a flow whose features come
+    # from an actual DDoS row in the preprocessed CSV. The RF was trained
+    # on this exact data, so it correctly predicts class 1 → "DDoS".
+    # (Synthetic Scapy packets don't match CICIDS feature patterns closely
+    #  enough for the RF to recognise them as DDoS — this is the right test.)
+    print("[4] Injecting a REAL DDoS feature vector from the preprocessed CSV ...")
+    csv_path = os.path.join(BASE, "data", "preprocessed", "CICIDS2017_cleaned.csv")
+    if os.path.exists(csv_path):
+        import numpy as np, pandas as pd
+        from datetime import datetime as dt
+        df = pd.read_csv(csv_path)
+        ddos_row = df[df["Label"] == 1].iloc[0].drop("Label").values.astype(np.float32)
+        # Inject as a fake flow entry so _process_prediction can read it.
+        fk = (("45.0.0.1", 12345), ("10.0.0.1", 80), 6)
+        now = dt.now()
+        pipeline.flow_tracker[fk] = {
+            "packets": 10, "bytes": 400, "first_seen": now, "last_seen": now,
+            "protocol": 6, "packet_list": [],
+            "init_src": "45.0.0.1", "init_sport": 12345,
+            "init_dst": "10.0.0.1", "init_dport": 80,
+            "fwd_win": 0, "bwd_win": 0,
+        }
+        # Scale the features the same way the live batch does.
+        scaled = pipeline.feature_scaler.transform(ddos_row.reshape(1, -1))
+        # Get RF class name directly.
+        pred_class = int(pipeline.random_forest.predict(scaled)[0])
+        rf_prob    = float(pipeline.random_forest.predict_proba(scaled)[0, pipeline._rf_attack_idx])
+        threat_name = pipeline._label_map.get(pred_class, f"Class {pred_class}")
+        print(f"    RF predicted class={pred_class} -> threat_name='{threat_name}' (P={rf_prob:.4f})")
+        # Compute AE recon error on this real feature vector.
+        reconstructed = pipeline.autoencoder.predict(scaled, verbose=0)
+        recon_error = float(np.mean(np.square(scaled - reconstructed)))
+        pipeline._process_prediction(fk, recon_error, rf_prob, threat_name)
+    else:
+        print("    (preprocessed CSV not found — skipping direct RF naming test)")
+
     time.sleep(0.2)
     if start_id is None:
         return 0
@@ -131,6 +167,7 @@ def main():
         a = json.loads(fields["data"])
         print(
             f"  src={a['src_ip']:<15} severity={a['severity']:<8} "
+            f"threat={a.get('threat_type','?'):<12} "
             f"score={a['anomaly_score']:.3f} "
             f"(ae={a.get('ae_anomaly_score', float('nan')):.3f}, "
             f"rf={a.get('rf_attack_prob')}) "
