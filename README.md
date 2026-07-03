@@ -19,7 +19,7 @@ Traditional network security relies on signature-based detection — a list of k
 
 ## How It Works
 
-```text
+```
 Network Traffic
       │
       ▼
@@ -46,15 +46,15 @@ Network Traffic
 ```
 Ensemble logic: Fused score = 0.5 × AE anomaly score + 0.5 × RF attack probability. Two override rules apply: if AE confidence exceeds 0.97, AE wins; if RF confidence exceeds 0.90, RF wins. An alert fires when the fused score exceeds 0.85.
 
-Setup Instructions
-Prerequisites
-Python 3.11
+---
 
-Node.js 20 LTS
+## Setup Instructions
 
-Redis (running locally on port 6379)
-
-Npcap (for live packet capture on Windows)
+**Prerequisites**
+* Python 3.11
+* Node.js 20 LTS
+* Redis (running locally on port 6379)
+* Npcap (for live packet capture on Windows)
 
 Install Dependencies
 ```bash
