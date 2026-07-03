@@ -90,4 +90,13 @@ backend/
     └── preprocessed/
         └── CICIDS2017_cleaned.csv
 ```
-Known LimitationsLive feature extraction covers ~24 of 78 CICIDS2017 features; remaining are zero-filled. RF classifies real CICIDS2017 vectors correctly but predicts Benign on Scapy-captured flows.The AE override handles live detection for those cases.CNN is offline-only — requires 100-flow ordered windows unavailable in per-flow live capture.run_training.py must be used on Windows instead of main.py --mode train to avoid joblib deadlock.
+
+---
+
+## Known Limitations
+
+* Live feature extraction covers ~24 of 78 CICIDS2017 features; remaining are zero-filled. 
+* RF classifies real CICIDS2017 vectors correctly but predicts Benign on Scapy-captured flows.
+* The AE override handles live detection for those cases.
+* CNN is offline-only — requires 100-flow ordered windows unavailable in per-flow live capture.
+* run_training.py must be used on Windows instead of main.py --mode train to avoid joblib deadlock.
