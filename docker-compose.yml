@@ -26,7 +26,11 @@ services:
     ports:
       - "3000:5000"
     env_file:
-      - ./backend/.env
+      # Optional: copy backend/.env.example -> backend/.env and fill in your
+      # API keys. The system runs without it; only AbuseIPDB threat-intel
+      # lookups will be unavailable if the key is missing.
+      - path: ./backend/.env
+        required: false
     environment:
       - REDIS_HOST=redis
       - AUTO_CAPTURE=true
