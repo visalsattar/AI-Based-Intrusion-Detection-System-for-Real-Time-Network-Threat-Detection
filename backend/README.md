@@ -1,4 +1,4 @@
-1. Backend README (backend/README.md)Markdown# Backend — AI-Based IDS
+# Backend README (backend/README.md)Markdown# Backend — AI-Based IDS
 
 Python backend handling packet capture, AI inference, alert streaming, and the Flask/Socket.IO dashboard API.
 
