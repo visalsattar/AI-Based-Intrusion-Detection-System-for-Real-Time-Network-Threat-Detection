@@ -21,14 +21,48 @@ Random Forest false positive rate: **0.25%** (84 / 33,790 benign flows).
 
 ```bash
 pip install -r requirements.txt
+```
 CommandsPreprocess dataset:Bashpython main.py --mode preprocess --dataset "data/<cicids-file>.csv" --multiclass
-Train models:Bashpython run_training.py
-Use this, not main.py --mode train — avoids a Windows joblib deadlock caused by Flask/SocketIO loading during cross-validation.Evaluate metrics:Bashpython src/model_evaluation.py data/preprocessed/CICIDS2017_cleaned.csv
-Run Flask server:Bashpython main.py
-Verify end-to-end pipeline:Bashpython verify_ensemble.py
-Calibrate override thresholds:Bashpython src/calibrate_override.py
-TestsBashpython -m pytest tests/ -v
-FileCountCoverstest_preprocessing.py4Inf removal, MinMax range, label encoding, text column droptest_model_training.py5Window shape, ordering, last-row label, small-split error, leakage regressiontest_inference.py11Scoring, overrides, alert gating, threat name propagationStructurePlaintextbackend/
+Train models:
+```Bash
+python run_training.py
+```
+Use this, not main.py --mode train — avoids a Windows joblib deadlock caused by Flask/SocketIO loading during cross-validation.
+
+Evaluate metrics:
+```Bash
+python src/model_evaluation.py data/preprocessed/CICIDS2017_cleaned.csv
+```
+
+Run Flask server:
+```Bash
+python main.py
+```
+
+Verify end-to-end pipeline:
+```Bash
+python verify_ensemble.py
+```
+
+Calibrate override thresholds:
+```Bash
+python src/calibrate_override.py
+```
+
+Tests
+```Bash
+python -m pytest tests/ -v
+```
+```
+File,Count,Covers
+test_preprocessing.py,4,"Inf removal, MinMax range, label encoding, text column drop"
+test_model_training.py,5,"Window shape, ordering, last-row label, small-split error, leakage regression"
+test_inference.py,11,"Scoring, overrides, alert gating, threat name propagation"
+```
+
+Structure
+```
+backend/
 ├── main.py                      # Flask server + IDS entry point
 ├── run_training.py              # Standalone training script
 ├── verify_ensemble.py           # End-to-end pipeline check
@@ -54,4 +88,5 @@ FileCountCoverstest_preprocessing.py4Inf removal, MinMax range, label encoding, 
 └── data/
     └── preprocessed/
         └── CICIDS2017_cleaned.csv
+```
 Known LimitationsLive feature extraction covers ~24 of 78 CICIDS2017 features; remaining are zero-filled. RF classifies real CICIDS2017 vectors correctly but predicts Benign on Scapy-captured flows.The AE override handles live detection for those cases.CNN is offline-only — requires 100-flow ordered windows unavailable in per-flow live capture.run_training.py must be used on Windows instead of main.py --mode train to avoid joblib deadlock.
