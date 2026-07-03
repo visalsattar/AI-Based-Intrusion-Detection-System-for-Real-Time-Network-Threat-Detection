@@ -43,6 +43,7 @@ Network Traffic
                                            │    React Dashboard      │
                                            │  (Flask + Socket.IO)    │
                                            └─────────────────────────┘
+```
 Ensemble logic: Fused score = 0.5 × AE anomaly score + 0.5 × RF attack probability. Two override rules apply: if AE confidence exceeds 0.97, AE wins; if RF confidence exceeds 0.90, RF wins. An alert fires when the fused score exceeds 0.85.
 
 Setup Instructions
@@ -56,7 +57,7 @@ Redis (running locally on port 6379)
 Npcap (for live packet capture on Windows)
 
 Install Dependencies
-Bash
+```bash
 # Backend
 cd backend
 pip install -r requirements.txt
@@ -64,52 +65,67 @@ pip install -r requirements.txt
 # Frontend
 cd frontend
 npm install
+```
+
 Running the System
 1. Preprocess dataset (first time only)
 
-Bash
+```Bash
 cd backend
 python main.py --mode preprocess --dataset "data/Friday-WorkingHours-Afternoon-DDoS.pcap_ISCX.csv" --multiclass
-2. Train models (first time only)
+```
 
+2. Train models (first time only)
+```
 Bash
 cd backend
 python run_training.py
+```
 Use run_training.py not main.py --mode train — avoids a Windows joblib deadlock.
 
 3. Evaluate model performance
-
+```
 Bash
 cd backend
 python src/model_evaluation.py data/preprocessed/CICIDS2017_cleaned.csv
-4. Start the backend
+```
 
+4. Start the backend
+```
 Bash
 cd backend
 python main.py
-5. Start the frontend
+```
 
+5. Start the frontend
+```
 Bash
 cd frontend
 npm start
+```
 Dashboard at http://localhost:3000.
 
 6. Verify the full pipeline
-
+```
 Bash
 cd backend
 python verify_ensemble.py
+```
 Expected:
-RF predicted class=1 -> threat_name='DDoS' (P=1.0000)
+```
+      RF predicted class=1 -> threat_name='DDoS' (P=1.0000)
 ALERTS RAISED: 3
   src=45.0.0.1  severity=CRITICAL  threat=DDoS  score=1.000
+```
 
 Running Tests
-Bash
+```Bash
 cd backend
 python -m pytest tests/ -v
+```
 20 tests — preprocessing, sequence construction (leakage regression), and live inference ensemble.
 
 Docker Configuration
-Bash
+```Bash
 docker compose up --build
+```
