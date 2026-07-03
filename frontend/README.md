@@ -66,7 +66,7 @@
 
   ---
   Pages
-
+```
   ┌──────────────┬───────────────────────┬──────────────────────────────────────────────────────────────────┐
   │     Page     │         File          │                           Description                            │
   ├──────────────┼───────────────────────┼──────────────────────────────────────────────────────────────────┤
@@ -78,10 +78,10 @@
   ├──────────────┼───────────────────────┼──────────────────────────────────────────────────────────────────┤
   │ Settings     │ pages/Settings.jsx    │ System configuration                                             │
   └──────────────┴───────────────────────┴──────────────────────────────────────────────────────────────────┘
-
+```
   ---
   Structure
-
+```
   src/
   ├── App.jsx                        # Router + page mounting
   ├── index.js                       # React entry point
@@ -101,7 +101,8 @@
       ├── Dashboard.css              # Dashboard layout
       ├── Navbar.css                 # Navigation styles
       └── Pages.css                  # Shared page styles
-
+```
+```
   ├──────────────┼───────────────────────┼──────────────────────────────────────────────────────────────────┤
   │ Dashboard    │ pages/Dashboard.jsx   │ Live alert feed, metric cards, traffic charts, socket connection │
   ├──────────────┼───────────────────────┼──────────────────────────────────────────────────────────────────┤
@@ -111,10 +112,10 @@
   ├──────────────┼───────────────────────┼──────────────────────────────────────────────────────────────────┤
   │ Settings     │ pages/Settings.jsx    │ System configuration                                             │
   └──────────────┴───────────────────────┴──────────────────────────────────────────────────────────────────┘
-
+```
   ---
   Structure
-
+```
   src/
   ├── App.jsx                        # Router + page mounting
   ├── index.js                       # React entry point
@@ -134,7 +135,7 @@
       ├── Dashboard.css              # Dashboard layout
       ├── Navbar.css                 # Navigation styles
       └── Pages.css                  # Shared page styles
-
+```
   ---
   How Alerts Arrive
 
