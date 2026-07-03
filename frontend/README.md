@@ -9,7 +9,7 @@
   ```bash
   npm install
   npm start
-
+```
   Dashboard available at http://localhost:3000.
 
   By default connects to http://localhost:5000. Override with:
@@ -17,7 +17,7 @@
 
   ---
   Pages
-
+```
   ┌──────────────┬───────────────────────┬──────────────────────────────────────────────────────────────────┐
   │     Page     │         File          │                           Description                            │
   ├──────────────┼───────────────────────┼──────────────────────────────────────────────────────────────────┤
@@ -29,7 +29,7 @@
   ├──────────────┼───────────────────────┼──────────────────────────────────────────────────────────────────┤
   │ Settings     │ pages/Settings.jsx    │ System configuration                                             │
   └──────────────┴───────────────────────┴──────────────────────────────────────────────────────────────────┘
-
+```
   ---
   Structure
 
@@ -58,7 +58,7 @@
   ```bash
   npm install
   npm start
-
+  ```
   Dashboard available at http://localhost:3000.
 
   By default connects to http://localhost:5000. Override with:
