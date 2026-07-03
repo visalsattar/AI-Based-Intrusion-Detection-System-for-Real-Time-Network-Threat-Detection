@@ -53,11 +53,14 @@ Tests
 ```Bash
 python -m pytest tests/ -v
 ```
+
+## Automated Test Metrics
 ```
-File,Count,Covers
-test_preprocessing.py,4,"Inf removal, MinMax range, label encoding, text column drop"
-test_model_training.py,5,"Window shape, ordering, last-row label, small-split error, leakage regression"
-test_inference.py,11,"Scoring, overrides, alert gating, threat name propagation"
+| File | Count | Covers |
+| :--- | :---: | :--- |
+| `test_preprocessing.py` | 4 | Inf removal, MinMax range, label encoding, text column drop |
+| `test_model_training.py` | 5 | Window shape, ordering, last-row label, small-split error, leakage regression |
+| `test_inference.py` | 11 | Scoring, overrides, alert gating, threat name propagation |
 ```
 
 Structure
