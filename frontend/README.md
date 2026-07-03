@@ -10,11 +10,12 @@
   npm install
   npm start
 ```
-  Dashboard available at http://localhost:3000.
+  Dashboard available at ```http://localhost:3000.```
 
   By default connects to http://localhost:5000. Override with:
+  ```
   REACT_APP_SOCKET_URL=http://your-backend-host:5000 npm start
-
+  ```
   ---
   Pages
 ```
@@ -32,7 +33,7 @@
 ```
   ---
   Structure
-
+```
   src/
   ├── App.jsx                        # Router + page mounting
   ├── index.js                       # React entry point
@@ -52,7 +53,7 @@
       ├── Dashboard.css              # Dashboard layout
       ├── Navbar.css                 # Navigation styles
       └── Pages.css                  # Shared page styles
-
+```
   ## Setup
 
   ```bash
