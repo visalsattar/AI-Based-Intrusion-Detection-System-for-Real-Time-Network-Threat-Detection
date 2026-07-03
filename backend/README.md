@@ -1,107 +1,100 @@
-# AI-Based Intrusion Detection System (Hybrid Architecture)
+  # Backend — AI-Based IDS
 
-A hybrid network intrusion detection system combining an unsupervised
-Autoencoder with supervised Random Forest and CNN classifiers, trained
-on the CICIDS2017 dataset.
+  Python backend handling packet capture, AI inference, alert streaming, and the Flask/Socket.IO dashboard API.
 
-## Status
+  ---
 
-This codebase was substantially debugged and corrected from an earlier
-version that contained several real issues: a debugging hack that
-force-labeled every live network flow as a CRITICAL alert regardless
-of the model's actual prediction, a feature-extraction routine that
-fed the model mostly zeros, a CNN trained on random noise instead of
-real data, and a dashboard backend that silently served fabricated
-alert data whenever Redis was unreachable. All of these were found,
-fixed, and verified against real data and real model runs. See
-`docs/CHANGES.md` for the full list, and Thesis Chapter 7/8 for the
-verified real performance numbers.
+  ## Model Performance (CICIDS2017 Friday DDoS — held-out test set)
 
-**Current real, verified performance** (held-out test set, CICIDS2017
-Friday DDoS capture):
+  | Model | Accuracy | Precision | Recall | F1 |
+  |---|---|---|---|---|
+  | Autoencoder | — | — | — | ROC-AUC 0.79 |
+  | Random Forest | 99.75% | 99.26% | 99.74% | **99.50%** |
+  | CNN | 99.76% | 99.12% | 99.91% | **99.51%** |
 
-| Model | Accuracy | Precision | Recall | F1 |
-|---|---|---|---|---|
-| Autoencoder (unsupervised) | ~78% | ~55-60% | ~44-49% | ~0.50-0.53 |
-| Random Forest (supervised) | 99.7% | 99.3% | 99.7% | 99.5% |
-| CNN (supervised) | 99.9% | 99.7% | 99.9% | 99.8% |
+  Calibrated reconstruction threshold: `0.003154` (90th percentile of benign errors).
+  Random Forest false positive rate: **0.25%** (84 / 33,790 benign flows).
 
-The Autoencoder's weaker performance relative to the supervised models
-is a genuine, explained finding (see Thesis Section 7.6), not a bug.
+  ---
 
-## Setup
+  ## Setup
 
-```bash
-pip install -r requirements.txt --break-system-packages
-```
+  ```bash
+  pip install -r requirements.txt
 
-(Requires: tensorflow, scikit-learn, pandas, numpy, flask, flask-socketio,
-flask-cors, redis, scapy, joblib, pytest)
+  ---
+  Commands
 
-## Running the pipeline
+  Preprocess dataset:
+  python main.py --mode preprocess --dataset "data/<cicids-file>.csv" --multiclass
 
-**1. Preprocess real CICIDS2017 data:**
-```bash
-python src/data_preprocessing.py data/CICIDS2017/<your-file>.csv
-```
+  Train models:
+  python run_training.py
+  Use this, not main.py --mode train — avoids a Windows joblib deadlock caused by Flask/SocketIO loading during cross-validation.
 
-**2. Train all three models:**
-```bash
-python main.py --mode train
-```
-This builds real sliding-window sequences from the preprocessed data
-(see `src/sequence_builder.py` for the methodology and an important
-note about using row-order as a proxy for temporal order, since this
-CICIDS2017 distribution has no Timestamp column), then trains the
-Autoencoder, Random Forest, and CNN.
+  Evaluate metrics:
+  python src/model_evaluation.py data/preprocessed/CICIDS2017_cleaned.csv
 
-**3. Evaluate real metrics:**
-```bash
-python src/model_evaluation.py data/preprocessed/<your-cleaned-file>.csv
-```
-Writes `models/real_metrics.json` with real, traceable numbers.
+  Run Flask server:
+  python main.py
 
-**4. Run the live sniffer (requires a real machine with NIC access --
-   cannot be run in a sandboxed/cloud dev environment):**
-```bash
-sudo python main.py --mode ids
-```
+  Verify end-to-end pipeline:
+  python verify_ensemble.py
 
-**5. Run the dashboard backend:**
-```bash
-docker compose up --build
-```
-Visit `http://localhost:5000`. Add `?demo=true` to see a clearly
-labeled demo alert without live traffic; without it, the dashboard
-shows real Redis state honestly, including an explicit error if
-Redis is unreachable (it will never silently substitute fake data).
+  Calibrate override thresholds:
+  python src/calibrate_override.py
 
-## Known limitations (see Thesis Chapter 8.2 for full discussion)
+  ---
+  Tests
 
-- Live sniffer computes ~24 of the model's 78 expected features in
-  real time (the rest are disclosed, not hidden, as zero-filled).
-- Trained and evaluated on one day of CICIDS2017 (DDoS traffic only),
-  not the full multi-day, multi-attack-type dataset.
-- Automated test suites (`tests/`) are scaffolded with documented
-  planned cases but not yet implemented; verification so far has been
-  manual (documented in Thesis Chapter 7.3/7.4).
-- Live end-to-end latency has not been formally benchmarked.
+  python -m pytest tests/ -v
 
-## Project structure
+  ┌────────────────────────┬───────┬───────────────────────────────────────────────────────────────────────────────┐
+  │          File          │ Count │                                    Covers                                     │
+  ├────────────────────────┼───────┼───────────────────────────────────────────────────────────────────────────────┤
+  │ test_preprocessing.py  │ 4     │ Inf removal, MinMax range, label encoding, text column drop                   │
+  ├────────────────────────┼───────┼───────────────────────────────────────────────────────────────────────────────┤
+  │ test_model_training.py │ 5     │ Window shape, ordering, last-row label, small-split error, leakage regression │
+  ├────────────────────────┼───────┼───────────────────────────────────────────────────────────────────────────────┤
+  │ test_inference.py      │ 11    │ Scoring, overrides, alert gating, threat name propagation                     │
+  └────────────────────────┴───────┴───────────────────────────────────────────────────────────────────────────────┘
 
-```
-backend/
-├── main.py                  # Entry point: preprocess / train / run IDS
-├── src/
-│   ├── data_preprocessing.py    # CICIDS2017 cleaning + MinMax scaling
-│   ├── sequence_builder.py      # CNN sequence construction (see docstring
-│   │                             #   for the leakage bug found & fixed here)
-│   ├── ai_model_development.py  # Autoencoder / RF / CNN architectures
-│   ├── model_evaluation.py      # Real metrics computation
-│   ├── ids_pipeline.py          # Live Scapy sniffer + real-time scoring
-│   └── backend.py               # Flask/Redis/SocketIO dashboard API
-├── models/                  # Trained model files + real_metrics.json
-├── data/                    # CICIDS2017 raw + preprocessed data
-├── tests/                   # Scaffolded test suite (see file docstrings)
-└── frontend/                # React dashboard
-```
+  ---
+  Structure
+
+  backend/
+  ├── main.py                      # Flask server + IDS entry point
+  ├── run_training.py              # Standalone training script
+  ├── verify_ensemble.py           # End-to-end pipeline check
+  ├── src/
+  │   ├── ids_pipeline.py          # Real-time AI engine (AE + RF ensemble)
+  │   ├── data_preprocessing.py    # CICIDS2017 cleaning + MinMax scaling
+  │   ├── sequence_builder.py      # CNN sliding-window sequence builder
+  │   ├── ai_model_development.py  # Model architectures + training
+  │   ├── model_evaluation.py      # Metrics → real_metrics.json
+  │   └── calibrate_override.py    # Data-driven override threshold calibration
+  ├── models/
+  │   ├── autoencoder.h5
+  │   ├── random_forest.pkl
+  │   ├── cnn_classifier.h5
+  │   ├── feature_scaler.pkl
+  │   ├── label_map.json           # {0: "Benign", 1: "DDoS"}
+  │   └── real_metrics.json
+  ├── tests/
+  │   ├── conftest.py
+  │   ├── test_preprocessing.py
+  │   ├── test_model_training.py
+  │   └── test_inference.py
+  └── data/
+      └── preprocessed/
+          └── CICIDS2017_cleaned.csv
+
+  ---
+  Known Limitations
+
+  - Live feature extraction covers ~24 of 78 CICIDS2017 features; remaining are zero-filled. RF classifies real CICIDS2017 vectors correctly but predicts Benign on Scapy-captured flows. The AE override handles live detection for those
+  cases.
+  - CNN is offline-only — requires 100-flow ordered windows unavailable in per-flow live capture.
+  - run_training.py must be used on Windows instead of main.py --mode train to avoid joblib deadlock.
+
+  ---
