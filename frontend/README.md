@@ -19,7 +19,7 @@ Override with:
 ```Bash
 REACT_APP_SOCKET_URL=http://your-backend-host:5000 npm start
 ```
-
+---
 ## Pages
 
 | Page | File | Description |
@@ -29,6 +29,7 @@ REACT_APP_SOCKET_URL=http://your-backend-host:5000 npm start
 | History | `pages/History.jsx` | Historical alert log |
 | Settings | `pages/Settings.jsx` | System configuration |
 
+---
 ## Structure
 ```
 src/
@@ -51,6 +52,8 @@ src/
     ├── Navbar.css                 # Navigation styles
     └── Pages.css                  # Shared page styles
 ```
+---
+
 ## How Alerts Arrive
 
 1. Backend detects a threat → publishes to Redis `ids:alerts` stream.
