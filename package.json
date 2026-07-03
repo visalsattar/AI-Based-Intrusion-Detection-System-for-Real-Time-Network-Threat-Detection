@@ -1,10 +1,11 @@
 {
-  "name": "aai-ids-final",
+  "name": "ai-based-ids-fyp-ii",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "AI-Based Intrusion Detection System — root convenience scripts",
   "scripts": {
-    "start": "concurrently \"docker-compose up\" \"npm run start --prefix frontend\""
+    "start": "docker-compose up --build",
+    "stop": "docker-compose down",
+    "dev": "concurrently \"python backend/main.py\" \"npm run start --prefix frontend\""
   },
   "keywords": [],
   "author": "",
