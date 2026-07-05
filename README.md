@@ -1,5 +1,8 @@
+---
+
 # AI-Based Intrusion Detection System (IDS)
 
+---
 ## Summary
 
 An AI-powered Network Intrusion Detection System (IDS) that monitors live network traffic and automatically detects cyberattacks in real time using a combination of three machine learning models. It was built as a Final Year Project (FYP-II) for a computer science/software engineering degree.
