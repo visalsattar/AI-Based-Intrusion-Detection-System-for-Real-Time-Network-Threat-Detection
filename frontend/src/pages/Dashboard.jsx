@@ -11,14 +11,18 @@
 
 import React, { useState, useEffect, useCallback } from 'react';
 import axios from 'axios';
-import io from 'socket.io-client';
+import { io } from "socket.io-client";
 import { MapContainer, TileLayer, CircleMarker, Popup } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 import { Laptop, Search, FileDown, RefreshCw } from 'lucide-react';
 import AlertTable from '../components/AlertTable';
 import { AttackDonut, NetworkTrafficChart } from '../components/TrafficCharts';
 
-const socket = io("/", {
+// --- WE ADDED THIS: Use Vercel's URL variable, or fallback to localhost ---
+const apiUrl = process.env.REACT_APP_API_URL || "http://localhost:5000";
+
+// --- WE UPDATED THIS: Point Socket.IO to the apiUrl ---
+const socket = io(apiUrl, {
   transports: ["polling", "websocket"],
   reconnectionAttempts: 5
 });
@@ -59,7 +63,8 @@ const Dashboard = () => {
   // --- Initial real history load (so the page isn't empty just because the
   // browser tab opened after alerts already happened) ---
   useEffect(() => {
-    axios.get('/api/history')
+    // WE UPDATED THIS AXIOS CALL
+    axios.get(`${apiUrl}/api/history`)
       .then(res => setAlerts(res.data.slice(0, 100)))
       .catch(err => console.error('Failed to load alert history:', err));
   }, []);
@@ -68,7 +73,8 @@ const Dashboard = () => {
   useEffect(() => {
     const fetchHealth = async () => {
       try {
-        const res = await axios.get('/api/health');
+        // WE UPDATED THIS AXIOS CALL
+        const res = await axios.get(`${apiUrl}/api/health`);
         setSysHealth(res.data);
       } catch (error) {
         console.error("Failed to fetch system health metrics.", error);
@@ -83,7 +89,8 @@ const Dashboard = () => {
   const fetchDevices = useCallback(async () => {
     setScanning(true);
     try {
-      const res = await axios.get('/api/network-devices');
+      // WE UPDATED THIS AXIOS CALL
+      const res = await axios.get(`${apiUrl}/api/network-devices`);
       setDevices(res.data);
     } catch (error) {
       console.error("Failed to fetch network devices.", error);
