@@ -1,0 +1,8 @@
+# .vercelignore
+backend/data/
+backend/models/
+backend/logs/
+*.csv
+*.h5
+*.npy
+*.pkl
