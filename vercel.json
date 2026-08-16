@@ -1,4 +1,5 @@
 {
+    "$schema": "https://openapi.vercel.sh/vercel.json",
     "services": {
         "frontend": {
             "root": "frontend",
@@ -7,6 +8,11 @@
         "backend": {
             "root": "backend",
             "entrypoint": "main:app"
+        }
+    },
+    "functions": {
+        "backend/main.py": {
+            "excludeFiles": "{tests/**,__tests__/**,**/*.test.py,**/test_*.py,fixtures/**,__fixtures__/**,testdata/**,sample-data/**,static/**,assets/**,backend/data/**,backend/models/**,backend/logs/**,*.csv,*.h5,*.pkl}"
         }
     },
     "rewrites": [
@@ -23,13 +29,6 @@
                 "type": "service",
                 "service": "frontend"
             }
-        {
-          "$schema": "https://openapi.vercel.sh/vercel.json",
-          "functions": {
-            "app.py": {
-              "excludeFiles": "{tests/**,__tests__/**,**/*.test.py,**/test_*.py,fixtures/**,__fixtures__/**,testdata/**,sample-data/**,static/**,assets/**}"
-            }
         }
     ]
 }
-
