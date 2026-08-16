@@ -63,10 +63,20 @@ const Dashboard = () => {
   // --- Initial real history load (so the page isn't empty just because the
   // browser tab opened after alerts already happened) ---
   useEffect(() => {
-    // WE UPDATED THIS AXIOS CALL
     axios.get(`${apiUrl}/api/history`)
-      .then(res => setAlerts(res.data.slice(0, 100)))
-      .catch(err => console.error('Failed to load alert history:', err));
+      .then(res => {
+        // Only set alerts if the backend actually sent an Array
+        if (Array.isArray(res.data)) {
+          setAlerts(res.data.slice(0, 100));
+        } else {
+          console.warn('Backend did not return an array. Check API connection.');
+          setAlerts([]); // Default to empty array to prevent crashes
+        }
+      })
+      .catch(err => {
+        console.error('Failed to load alert history:', err);
+        setAlerts([]); // Default to empty array on network failure
+      });
   }, []);
 
   // --- Real system health poller (CPU/RAM/Disk via psutil) ---
