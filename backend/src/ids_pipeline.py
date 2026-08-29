@@ -398,6 +398,20 @@ class RealTimeIDSPipeline:
                 return
             
             features_array = np.array(features_batch)
+
+            # Sanity-check: feature vector length must match the scaler's expected columns.
+            # Fail fast and loudly so we never silently feed misaligned vectors to the model.
+            expected_len = len(self.feature_scaler.feature_names_in_)
+            if features_array.shape[1] != expected_len:
+                logger.error(
+                    "Feature vector length mismatch before scaling: "
+                    f"got {features_array.shape[1]}, expected {expected_len}. "
+                    "This indicates live feature extraction does not match the training schema."
+                )
+                raise RuntimeError(
+                    f"Feature vector length mismatch: got {features_array.shape[1]}, expected {expected_len}"
+                )
+
             features_normalized = self.feature_scaler.transform(features_array)
             
             reconstructed = self.autoencoder.predict(
@@ -446,7 +460,7 @@ class RealTimeIDSPipeline:
                 )
 
         except Exception as e:
-            logger.error(f"Inference batch error: {e}")
+            logger.error(f"Infrence batch error: {e}")
         finally:
             # Reclaim finished/stale flows every batch so the table stays
             # bounded even under a long capture or a high-cardinality flood.
