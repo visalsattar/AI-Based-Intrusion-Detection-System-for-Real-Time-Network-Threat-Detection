@@ -1,204 +1,153 @@
-# backend/routes.py
-import json
-import logging
-from collections import defaultdict
-from flask import jsonify, request
-import psutil
-
-from geo_utils import get_ip_location, reload_reader
-import geo_utils
-from network_utils import list_interfaces, list_arp_devices
-from system_status import get_full_status
-import threat_intel_service
-
-logger = logging.getLogger("IDS-Routes")
-
-DEFAULT_SETTINGS = {
-    "sensitivity": "medium",
-    "networkInterface": "auto",
-    "flowTimeout": 120,
-    "sound": True,
-    "desktopNotifications": True,
-    "geolocationEnabled": True,
-    "threatIntelEnabled": True,
-    "abuseIPDBKey": "b53a79c38b09ffa49c72005954d5b6f59e31a40876d62fed29eff5e94fd5efd33e03806e01b7d8ef",
-    "criticalThreshold": 0.95,
-    "highThreshold": 0.85,
-}
-
-
-def _read_alerts_from_redis(redis_client, count=200):
-    """Reads the most recent real alerts from the 'ids:alerts' stream, newest first."""
-    if not redis_client:
-        return []
-    try:
-        raw = redis_client.xrevrange('ids:alerts', count=count)
-        alerts = []
-        for _msg_id, fields in raw:
-            try:
-                alerts.append(json.loads(fields['data']))
-            except (KeyError, json.JSONDecodeError):
-                continue
-        return alerts
-    except Exception as e:
-        logger.warning(f"Redis read failed: {e}")
-        return []
-
-
-def _load_settings(redis_client) -> dict:
-    settings = dict(DEFAULT_SETTINGS)
-    if redis_client:
-        try:
-            stored = redis_client.get('ids:settings')
-            if stored:
-                settings.update(json.loads(stored))
-        except Exception as e:
-            logger.warning(f"Could not read settings from Redis: {e}")
-    return settings
-
-
-def register_routes(app, redis_client=None):
-    """
-    Registers JSON API routes consumed by the React dashboard.
-
-    Every route here reads real data: the Redis 'ids:alerts' stream (written
-    by RealTimeIDSPipeline once packet capture is running), the real
-    AbuseIPDB API, the real on-disk GeoIP/model status, and real OS-level
-    network introspection. There is no mock/demo data path.
-    """
-
-    # ---------------- System health (real psutil metrics) ----------------
-
-    @app.route('/api/health', methods=['GET'])
-    def health_check():
-        return jsonify({
-            'status': 'running',
-            'cpu': psutil.cpu_percent(interval=0.1),
-            'ram': psutil.virtual_memory().percent,
-            'disk': psutil.disk_usage('/').percent,
-            'redis': 'connected' if redis_client else 'disconnected',
-        })
-
-    # ---------------- Alerts ----------------
-
-    @app.route('/api/history', methods=['GET'])
-    def get_history():
-        alerts = _read_alerts_from_redis(redis_client)
-        for a in alerts:
-            a.setdefault('location', get_ip_location(a.get('src_ip')))
-        return jsonify(alerts)
-
-    @app.route('/api/history', methods=['DELETE'])
-    def clear_history():
-        """Backs the 'Clear Logs' button — actually trims the real Redis stream."""
-        if not redis_client:
-            return jsonify({'status': 'error', 'message': 'Redis unavailable'}), 503
-        try:
-            redis_client.delete('ids:alerts')
-            return jsonify({'status': 'success', 'message': 'Alert history cleared'})
-        except Exception as e:
-            logger.error(f"Failed to clear history: {e}")
-            return jsonify({'status': 'error', 'message': str(e)}), 500
-
-    # ---------------- Threat Intelligence (real AbuseIPDB) ----------------
-
-    @app.route('/api/threat-intel', methods=['GET'])
-    def get_threat_intel():
-        alerts = _read_alerts_from_redis(redis_client)
-
-        # Aggregate local detection stats per source IP first (cheap, no API calls)
-        by_ip = defaultdict(lambda: {'hits': 0, 'last_seen': 0, 'severity': 'MEDIUM'})
-        severity_rank = {'MEDIUM': 0, 'HIGH': 1, 'CRITICAL': 2}
-        for a in alerts:
-            ip = a.get('src_ip')
-            if not ip:
-                continue
-            bucket = by_ip[ip]
-            bucket['hits'] += 1
-            bucket['last_seen'] = max(bucket['last_seen'], a.get('timestamp', 0))
-            sev = a.get('severity', 'MEDIUM')
-            if severity_rank.get(sev, 0) > severity_rank.get(bucket['severity'], 0):
-                bucket['severity'] = sev
-
-        # Most active IPs first, capped — each uncached IP costs one real AbuseIPDB call
-        ranked_ips = sorted(by_ip.keys(), key=lambda ip: by_ip[ip]['hits'], reverse=True)
-        abuse_results = {r['ip']: r for r in threat_intel_service.lookup_many(ranked_ips, redis_client)}
-
-        records = []
-        for ip in ranked_ips:
-            local = by_ip[ip]
-            abuse = abuse_results.get(ip, {"status": "not_configured"})
-            records.append({
-                'ip': ip,
-                'source': 'Local Detection',
-                'hits': local['hits'],
-                'severity': local['severity'],
-                'last_seen': local['last_seen'],
-                'location': get_ip_location(ip),
-                'abuse_score': abuse.get('abuse_score'),
-                'reports': abuse.get('reports'),
-                'isp': abuse.get('isp'),
-                'last_reported': abuse.get('last_reported'),
-                'intel_status': abuse.get('status'),
-            })
-
-        return jsonify({
-            'records': records,
-            'count': len(records),
-            'geolocation_db': geo_utils.get_status(),
-        })
-
-    # ---------------- System status / model status ----------------
-
-    @app.route('/api/system-info', methods=['GET'])
-    def get_system_info():
-        return jsonify(get_full_status(redis_client))
-
-    @app.route('/api/reload-geoip', methods=['POST'])
-    def reload_geoip():
-        status = reload_reader()
-        return jsonify(status)
-
-    # ---------------- Network introspection ----------------
-
-    @app.route('/api/network-interfaces', methods=['GET'])
-    def get_network_interfaces():
-        return jsonify(list_interfaces())
-
-    @app.route('/api/network-devices', methods=['GET'])
-    def get_network_devices():
-        return jsonify(list_arp_devices())
-
-    # ---------------- Settings ----------------
-
-    @app.route('/api/settings', methods=['GET'])
-    def get_settings():
-        settings = _load_settings(redis_client)
-        # Never echo the raw API key back to the client beyond a masked preview
-        if settings.get('abuseIPDBKey'):
-            settings['abuseIPDBKeySet'] = True
-            settings['abuseIPDBKey'] = ''
-        else:
-            settings['abuseIPDBKeySet'] = False
-        return jsonify(settings)
-
-    @app.route('/api/save-settings', methods=['POST'])
-    def save_settings():
-        incoming = request.json or {}
-        current = _load_settings(redis_client)
-
-        # Don't overwrite a previously-saved key with a blank field submission
-        if not incoming.get('abuseIPDBKey'):
-            incoming.pop('abuseIPDBKey', None)
-
-        current.update(incoming)
-        if redis_client:
-            try:
-                redis_client.set('ids:settings', json.dumps(current))
-            except Exception as e:
-                logger.error(f"Failed to persist settings: {e}")
-                return jsonify({'status': 'error', 'message': str(e)}), 500
-        else:
-            return jsonify({'status': 'error', 'message': 'Redis unavailable — settings not persisted'}), 503
-
-        return jsonify({'status': 'success', 'message': 'Configuration updated'})
+*** Begin Patch
+*** Update File: backend/routes.py
+@@
+ from geo_utils import get_ip_location, reload_reader
+ import geo_utils
+ from network_utils import list_interfaces, list_arp_devices
+ from system_status import get_full_status
+ import threat_intel_service
++import os
++import time
++from flask import abort
++from ids_pipeline import block_ip
+@@
+     @app.route('/api/settings', methods=['GET'])
+     def get_settings():
+@@
+         return jsonify(settings)
+@@
+     @app.route('/api/save-settings', methods=['POST'])
+     def save_settings():
+@@
+         return jsonify({'status': 'success', 'message': 'Configuration updated'})
++
++    # ---------------- Proposed block / approval workflow ----------------
++    @app.route('/api/proposed-blocks', methods=['GET'])
++    def list_proposed_blocks():
++        """List recent proposed blocks from the ids:proposed_blocks Redis stream."""
++        if not redis_client:
++            return jsonify({'status': 'error', 'message': 'Redis unavailable'}), 503
++        count = int(request.args.get('count', 100))
++        try:
++            raw = redis_client.xrevrange('ids:proposed_blocks', count=count)
++            entries = []
++            for msg_id, fields in raw:
++                # fields are bytes/strings depending on client; ensure strings
++                entry = {k.decode() if isinstance(k, bytes) else k: (v.decode() if isinstance(v, bytes) else v) for k, v in fields.items()}
++                entries.append({'id': msg_id, 'data': entry})
++            return jsonify({'count': len(entries), 'entries': entries})
++        except Exception as e:
++            logger.error(f"Failed to read proposed blocks: {e}")
++            return jsonify({'status': 'error', 'message': str(e)}), 500
++
++    def _require_admin_api_key():
++        key = os.environ.get('BACKEND_ADMIN_API_KEY')
++        if not key:
++            # No API key configured -> deny by default
++            abort(403, "Admin API key not configured on server")
++        auth = request.headers.get('Authorization','')
++        if not auth.startswith('Bearer '):
++            abort(401, 'Missing bearer token')
++        token = auth.split(' ',1)[1].strip()
++        if token != key:
++            abort(403, 'Invalid admin API key')
++
++    @app.route('/api/approve-block', methods=['POST'])
++    def approve_block():
++        """Approve a proposed block. Supports multi-approver policy via BLOCK_APPROVAL_REQUIRED."""
++        _require_admin_api_key()
++        payload = request.json or {}
++        entry_id = payload.get('entry_id')
++        approver = payload.get('approver') or 'unknown'
++        if not entry_id:
++            return jsonify({'status': 'error', 'message': 'entry_id required'}), 400
++        if not redis_client:
++            return jsonify({'status': 'error', 'message': 'Redis unavailable'}), 503
++        try:
++            # Read specific entry
++            items = redis_client.xrange('ids:proposed_blocks', min=entry_id, max=entry_id)
++            if not items:
++                return jsonify({'status': 'error', 'message': 'entry not found'}), 404
++            _id, fields = items[0]
++            # normalize fields
++            entry = {k.decode() if isinstance(k, bytes) else k: (v.decode() if isinstance(v, bytes) else v) for k, v in fields.items()}
++            src_ip = entry.get('src_ip')
++
++            # Load whitelist
++            base = os.path.abspath(os.path.join(os.path.dirname(__file__), ''))
++            whitelist_path = os.path.join(base, 'config', 'whitelist.json')
++            whitelist = []
++            try:
++                if os.path.exists(whitelist_path):
++                    with open(whitelist_path) as fh:
++                        import json as _json
++                        whitelist = _json.load(fh)
++            except Exception:
++                whitelist = []
++
++            if src_ip in whitelist:
++                return jsonify({'status': 'error', 'message': 'IP is whitelisted and cannot be auto-blocked'}), 403
++
++            approvals_key = f"proposed:{entry_id}:approvals"
++            redis_client.sadd(approvals_key, approver)
++            count = redis_client.scard(approvals_key)
++            required = int(os.environ.get('BLOCK_APPROVAL_REQUIRED', '2'))
++            if count >= required:
++                # Execute the block and write an approved_blocks stream entry + audit
++                try:
++                    block_ip(src_ip)
++                except Exception as e:
++                    logger.error(f"Failed to execute block_ip for {src_ip}: {e}")
++                    return jsonify({'status': 'error', 'message': f'block failed: {e}'}), 500
++                approved_entry = {
++                    'src_ip': src_ip,
++                    'reason': entry.get('reason',''),
++                    'alert': entry.get('alert',''),
++                    'detected_at': entry.get('detected_at',''),
++                    'approved_by': approver,
++                    'approved_at': str(int(time.time())),
++                    'approval_count': str(count)
++                }
++                try:
++                    redis_client.xadd('ids:approved_blocks', approved_entry)
++                except Exception:
++                    logger.warning('Failed to record approved_blocks stream')
++                # Audit log
++                try:
++                    os.makedirs('logs', exist_ok=True)
++                    with open('logs/blocks.log', 'a') as f:
++                        f.write(f"{int(time.time())} APPROVED {entry_id} src={src_ip} by={approver} count={count}\n")
++                except Exception:
++                    logger.warning('Failed to write audit log for block approval')
++                return jsonify({'status': 'approved', 'approved_by': approver, 'approval_count': count})
++            else:
++                return jsonify({'status': 'pending', 'approval_count': count, 'needed': required - count}), 202
++        except Exception as e:
++            logger.error(f"approve-block error: {e}")
++            return jsonify({'status': 'error', 'message': str(e)}), 500
++
++    @app.route('/api/deny-block', methods=['POST'])
++    def deny_block():
++        _require_admin_api_key()
++        payload = request.json or {}
++        entry_id = payload.get('entry_id')
++        approver = payload.get('approver') or 'unknown'
++        reason = payload.get('reason','manual deny')
++        if not entry_id:
++            return jsonify({'status': 'error', 'message': 'entry_id required'}), 400
++        if not redis_client:
++            return jsonify({'status': 'error', 'message': 'Redis unavailable'}), 503
++        try:
++            # record denial and audit
++            os.makedirs('logs', exist_ok=True)
++            with open('logs/blocks.log', 'a') as f:
++                f.write(f"{int(time.time())} DENIED {entry_id} by={approver} reason={reason}\n")
++            try:
++                redis_client.xadd('ids:denied_blocks', {'entry_id': entry_id, 'denied_by': approver, 'reason': reason, 'time': str(int(time.time()))})
++            except Exception:
++                logger.warning('Failed to record denied_blocks stream')
++            return jsonify({'status': 'denied'})
++        except Exception as e:
++            logger.error(f"deny-block error: {e}")
++            return jsonify({'status': 'error', 'message': str(e)}), 500
+*** End Patch
