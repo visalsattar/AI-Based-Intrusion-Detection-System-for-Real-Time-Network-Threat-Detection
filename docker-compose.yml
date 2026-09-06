@@ -40,6 +40,8 @@ services:
       # the dashboard would run, but never see real traffic.
       - NET_ADMIN
       - NET_RAW
+    cap_drop:
+      - ALL  
     restart: unless-stopped
     depends_on:
       redis:
