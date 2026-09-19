@@ -57,9 +57,11 @@ python -m pytest tests/ -v
 ## Automated Test Metrics
 | File | Count | Covers |
 | :--- | :---: | :--- |
-| `test_preprocessing.py` | 4 | Inf removal, MinMax range, label encoding, text column drop |
+| `test_preprocessing.pY` | 4 | Inf removal, MinMax range, label encoding, text column drop |
 | `test_model_training.py` | 5 | Window shape, ordering, last-row label, small-split error, leakage regression |
 | `test_inference.py` | 11 | Scoring, overrides, alert gating, threat name propagation |
+| `test_feature_alignment.py` | 1 | Confirms feature_scaler.pkl exists and carries feature names (inferred from test name — verify against actual file) |
+| `test_proposed_block_queue.py` | 1 | Confirms a proposed IP-block queue writes to Redis via xadd (inferred from test name — verify against actual file) |
 
 Structure
 ```
@@ -85,7 +87,9 @@ backend/
 │   ├── conftest.py
 │   ├── test_preprocessing.py
 │   ├── test_model_training.py
-│   └── test_inference.py
+│   ├── test_inference.py
+│   ├── test_feature_alignment.py
+│   └── test_proposed_block_queue.py
 └── data/
     └── preprocessed/
         └── CICIDS2017_cleaned.csv
