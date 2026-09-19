@@ -16,7 +16,7 @@ Traditional network security relies on signature-based detection — a list of k
 - Real dataset — 225,745 actual network flows (CICIDS2017), not toy data
 - Full stack — AI + backend + frontend + Docker + CI all working together
 - Honest reporting — the Autoencoder's weaker standalone performance is disclosed, not hidden
-- 20 automated tests, including a regression test for train/test leakage
+- 22 automated tests, including a regression test for train/test leakage
 - Redis Streams, WebSockets, and Docker health checks for the live pipeline
 
 ---
