@@ -136,7 +136,7 @@ ALERTS RAISED: 3
 cd backend
 python -m pytest tests/ -v
 ```
-20 tests covering preprocessing, sequence construction (including a train/test leakage regression), and live inference fusion logic.
+22 tests covering preprocessing, sequence construction (including a train/test leakage regression), and live inference fusion logic.
 
 **Docker**
 ```bash
