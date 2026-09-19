@@ -17,9 +17,9 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
-from scapy.all import IP, TCP  # noqa: E402
-from redis import Redis  # noqa: E402
-from ids_pipeline import RealTimeIDSPipeline  # noqa: E402
+from scapy.all import IP, TCP  # type: ignore[reportMissingImports]  # noqa: E402
+from redis import Redis  # type: ignore[reportMissingImports]  # noqa: E402
+from ids_pipeline import RealTimeIDSPipeline  # type: ignore[reportMissingImports]  # noqa: E402
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE, "models", "autoencoder.h5")
@@ -126,7 +126,8 @@ def main():
     print("[4] Injecting a REAL DDoS feature vector from the preprocessed CSV ...")
     csv_path = os.path.join(BASE, "data", "preprocessed", "CICIDS2017_cleaned.csv")
     if os.path.exists(csv_path):
-        import numpy as np, pandas as pd
+        import numpy as np  # type: ignore[reportMissingImports]
+        import pandas as pd  # type: ignore[reportMissingImports]
         from datetime import datetime as dt
         df = pd.read_csv(csv_path)
         ddos_row = df[df["Label"] == 1].iloc[0].drop("Label").values.astype(np.float32)
