@@ -84,8 +84,9 @@ const Settings = () => {
       setSaveState('success');
       await loadAll(); // refresh masked key state / system info
     } catch (e) {
-      console.error('Failed to save settings:', e);
-      setSaveState('error');
+    console.error('Failed to save settings:', e);
+    const msg = e.response?.data?.message || e.response?.statusText || 'Check backend connectivity.';
+    setSaveState(`error:${msg}`);
     } finally {
       setSaving(false);
       setTimeout(() => setSaveState(null), 4000);
@@ -259,7 +260,7 @@ const Settings = () => {
             <div>
               <label>AbuseIPDB API Key</label>
               <span className="setting-hint">
-                {settings.abuseIPDBKeySet ? 'A key is already saved — leave blank to keep it.' : (
+                {settings.abuseIPDBKeySet ? 'A key is already sved — leave blank to keep it.' : (
                   <>Get a free key at{' '}
                     <a href="https://www.abuseipdb.com" target="_blank" rel="noreferrer" style={{ color: 'var(--data)' }}>
                       abuseipdb.com
