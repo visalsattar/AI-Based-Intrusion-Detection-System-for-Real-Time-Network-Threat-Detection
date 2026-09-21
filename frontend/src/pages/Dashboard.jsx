@@ -11,23 +11,21 @@
 
 import React, { useState, useEffect, useCallback } from 'react';
 import axios from 'axios';
-import { io } from "socket.io-client";
+import io from 'socket.io-client';
 import { MapContainer, TileLayer, CircleMarker, Popup } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 import { Laptop, Search, FileDown, RefreshCw } from 'lucide-react';
 import AlertTable from '../components/AlertTable';
 import { AttackDonut, NetworkTrafficChart } from '../components/TrafficCharts';
 
-// --- WE ADDED THIS: Use Vercel's URL variable, or fallback to localhost ---
-const apiUrl = process.env.REACT_APP_API_URL || "http://localhost:5000";
-
-// --- WE UPDATED THIS: Point Socket.IO to the apiUrl ---
-const socket = io(apiUrl, {
+const socket = io("/", {
   transports: ["polling", "websocket"],
   reconnectionAttempts: 5
 });
 
 const SEVERITY_COLOR = { CRITICAL: '#EF4444', HIGH: '#F59E0B', MEDIUM: '#38BDF8' };
+const CARTO_KEY = process.env.REACT_APP_CARTO_KEY;
+const TILE_URL = `https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png${CARTO_KEY ? `?key=${CARTO_KEY}` : 'cb1_3r9v_1_f1b92950eee0c4f655a02dfa'}`;
 
 // The signature element: a literal signal trace. Animates only while genuinely connected.
 const PulseLine = ({ connected }) => (
@@ -51,6 +49,21 @@ const downloadJSON = (data, filename) => {
   URL.revokeObjectURL(url);
 };
 
+const alertKey = (alert) => [
+  alert.timestamp,
+  alert.src_ip,
+  alert.dst_ip,
+  alert.packet_count,
+  alert.bytes_transferred,
+  alert.anomaly_score,
+].join('|');
+
+const mergeAlerts = (current, incoming) => {
+  const merged = Array.isArray(incoming) ? [...incoming, ...current] : [incoming, ...current];
+  return Array.from(new Map(merged.map(alert => [alertKey(alert), alert])).values())
+    .slice(0, 100);
+};
+
 const Dashboard = () => {
   const [sysHealth, setSysHealth] = useState({ cpu: 0, ram: 0, disk: 0 });
   const [alerts, setAlerts] = useState([]);
@@ -63,28 +76,16 @@ const Dashboard = () => {
   // --- Initial real history load (so the page isn't empty just because the
   // browser tab opened after alerts already happened) ---
   useEffect(() => {
-    axios.get(`${apiUrl}/api/history`)
-      .then(res => {
-        // Only set alerts if the backend actually sent an Array
-        if (Array.isArray(res.data)) {
-          setAlerts(res.data.slice(0, 100));
-        } else {
-          console.warn('Backend did not return an array. Check API connection.');
-          setAlerts([]); // Default to empty array to prevent crashes
-        }
-      })
-      .catch(err => {
-        console.error('Failed to load alert history:', err);
-        setAlerts([]); // Default to empty array on network failure
-      });
+    axios.get('/api/history')
+      .then(res => setAlerts(prev => mergeAlerts(prev, Array.isArray(res.data) ? res.data : [])))
+      .catch(err => console.error('Failed to load alert history:', err));
   }, []);
 
   // --- Real system health poller (CPU/RAM/Disk via psutil) ---
   useEffect(() => {
     const fetchHealth = async () => {
       try {
-        // WE UPDATED THIS AXIOS CALL
-        const res = await axios.get(`${apiUrl}/api/health`);
+        const res = await axios.get('/api/health');
         setSysHealth(res.data);
       } catch (error) {
         console.error("Failed to fetch system health metrics.", error);
@@ -99,8 +100,7 @@ const Dashboard = () => {
   const fetchDevices = useCallback(async () => {
     setScanning(true);
     try {
-      // WE UPDATED THIS AXIOS CALL
-      const res = await axios.get(`${apiUrl}/api/network-devices`);
+      const res = await axios.get('/api/network-devices');
       setDevices(res.data);
     } catch (error) {
       console.error("Failed to fetch network devices.", error);
@@ -133,7 +133,7 @@ const Dashboard = () => {
     const handleDisconnect = () => setIsConnected(false);
 
     const handleNewAlert = (alert) => {
-      setAlerts(prev => [alert, ...prev.slice(0, 99)]);
+      setAlerts(prev => mergeAlerts(prev, alert));
       if (alert.severity === 'CRITICAL') {
         new Audio('/critical.mp3').play().catch(() => {});
       } else if (alert.severity === 'HIGH') {
@@ -207,9 +207,11 @@ const Dashboard = () => {
             <MapContainer center={[20, 10]} zoom={1.5} minZoom={1.5} worldCopyJump
               style={{ height: '100%', width: '100%', background: '#0B0E14' }}>
               <TileLayer
-                url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
-                attribution='&copy; <a href="https://carto.com/attributions">CARTO</a>'
-              />
+                    url={TILE_URL}
+                    attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>, &copy; <a href="https://carto.com/attributions">CARTO</a>'
+                    subdomains="abcd"
+                    maxZoom={20}
+                  />
               {mappable.map((a, i) => (
                 <CircleMarker
                   key={`${a.src_ip}-${a.timestamp}-${i}`}
