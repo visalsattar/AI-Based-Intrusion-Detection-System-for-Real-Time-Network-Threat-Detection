@@ -21,7 +21,7 @@ DEFAULT_SETTINGS = {
     "desktopNotifications": True,
     "geolocationEnabled": True,
     "threatIntelEnabled": True,
-    "abuseIPDBKey": "", # The actual key is never stored in plaintext in Redis; only a masked preview is returned to the client.supplied via .env or the Settings page
+    "abuseIPDBKey": "",     # The actual key is never stored in plaintext in Redis; only a masked preview is returned to the client.supplied via .env or the Settings page
     "criticalThreshold": 0.95,
     "highThreshold": 0.85,
 }
