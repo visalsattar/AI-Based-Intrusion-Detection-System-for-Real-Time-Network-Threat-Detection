@@ -1,4 +1,4 @@
-# AI-Based Intrusion Detection System (IDS)
+# AI based Intrusion Detection System for Real-Time Network Threat Detection
 
 Final Year Project — BS Computer Science, The University of Agriculture, Peshawar
 
@@ -12,6 +12,7 @@ An AI-powered Network Intrusion Detection System (IDS) that monitors live networ
 Traditional network security relies on signature-based detection — a list of known attack patterns. If an attacker uses a new technique not in the list, it goes undetected. This system learns what normal traffic looks like and flags anything that deviates, including attacks that have never been seen before.
 
 **Why It Is a Strong Project:**
+
 - Two models fused for live detection, with a third (CNN) built and benchmarked offline to compare architectures
 - Real dataset — 225,745 actual network flows (CICIDS2017), not toy data
 - Full stack — AI + backend + frontend + Docker + CI all working together
@@ -23,7 +24,7 @@ Traditional network security relies on signature-based detection — a list of k
 
 ## How It Works
 
-```
+```text
 Network Traffic
       │
       ▼
@@ -58,7 +59,7 @@ Network Traffic
 ## Model Performance (held-out test set)
 
 | Model | F1-Score | Role |
-|---|---|---|
+| --- | --- | --- |
 | Random Forest | ~99.5% | Live fusion |
 | Autoencoder | ~52-54%* | Live fusion |
 | CNN | ~99.5% | Offline only |
@@ -70,6 +71,7 @@ Network Traffic
 ## Setup Instructions
 
 **Prerequisites**
+
 - Python 3.11
 - Node.js 20 LTS
 - Redis (running locally on port 6379)
@@ -78,6 +80,7 @@ Network Traffic
 **Dataset:** This repo does not include the CICIDS2017 dataset (too large for GitHub). Download `Friday-WorkingHours-Afternoon-DDoS.pcap_ISCX.csv` from the [official CIC dataset page](https://www.unb.ca/cic/datasets/ids-2017.html) and place it in `backend/data/CICIDS2017/` if you plan to preprocess or retrain.
 
 **Install dependencies**
+
 ```bash
 # Backend
 cd backend
@@ -93,6 +96,7 @@ npm install
 Download `autoencoder.h5`, `random_forest.pkl`, `cnn_classifier.h5`, `feature_scaler.pkl`, and `label_map.json` from the [Releases page](https://github.com/visalsattar/AI-Based-Intrusion-Detection-System-for-Real-Time-Network-Threat-Detection/releases) and place them in `backend/models/`. Then skip to *Running the system* below.
 
 **Option B — Train from scratch**
+
 ```bash
 cd backend
 
@@ -108,6 +112,7 @@ python src/model_evaluation.py data/preprocessed/CICIDS2017_cleaned.csv
 ```
 
 **Running the system**
+
 ```bash
 # Start the backend
 cd backend
@@ -117,14 +122,18 @@ python main.py
 cd frontend
 npm start
 ```
+
 Dashboard available at `http://localhost:3000`.
 
 **Verify the full pipeline**
+
 ```bash
 cd backend
 python verify_ensemble.py
 ```
+
 Expected output:
+
 ```
 RF predicted class=1 -> threat_name='DDoS' (P=1.0000)
 ALERTS RAISED: 3
@@ -132,13 +141,16 @@ ALERTS RAISED: 3
 ```
 
 **Run tests**
+
 ```bash
 cd backend
 python -m pytest tests/ -v
 ```
+
 22 tests covering preprocessing, sequence construction (including a train/test leakage regression), and live inference fusion logic.
 
 **Docker**
+
 ```bash
 docker compose up --build
 ```
