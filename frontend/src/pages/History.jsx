@@ -13,6 +13,21 @@ import axios from 'axios';
 import io from 'socket.io-client';
 import { Search, FileDown, Trash2 } from 'lucide-react';
 
+const alertKey = (alert) => [
+  alert.timestamp,
+  alert.src_ip,
+  alert.dst_ip,
+  alert.packet_count,
+  alert.bytes_transferred,
+  alert.anomaly_score,
+].join('|');
+
+const mergeAlerts = (current, incoming) => {
+  const merged = Array.isArray(incoming) ? [...incoming, ...current] : [incoming, ...current];
+  return Array.from(new Map(merged.map(alert => [alertKey(alert), alert])).values())
+    .slice(0, 300);
+};
+
 const socket = io('/', { transports: ['polling', 'websocket'] });
 
 const formatTimestamp = (timestamp) => {
@@ -37,7 +52,7 @@ const History = () => {
   useEffect(() => {
     axios.get('/api/history')
       .then(res => {
-        setAlerts(res.data);
+        setAlerts(prev => mergeAlerts(prev, res.data));
         setLoading(false);
       })
       .catch(err => {
@@ -50,7 +65,7 @@ const History = () => {
   // Live updates: prepend any alert emitted while this page is open
   useEffect(() => {
     const handleNewAlert = (alert) => {
-      setAlerts(prev => [alert, ...prev].slice(0, 300));
+      setAlerts(prev => mergeAlerts(prev, alert));
     };
     socket.on('new_alert', handleNewAlert);
     return () => socket.off('new_alert', handleNewAlert);
