@@ -1,8 +1,6 @@
-# Frontend — AI-Based IDS Dashboard
+# Frontend - AI-Based IDS Dashboard
 
-Real-time React dashboard for the AI-Based Intrusion Detection System. Connects to the Flask backend via Socket.IO and displays live alerts, traffic charts, threat intelligence, and system settings.
-
----
+React dashboard for the AI-Based Intrusion Detection System. It displays alert history, live alerts, traffic charts, threat intelligence, and system settings.
 
 ## Setup
 
@@ -10,60 +8,63 @@ Real-time React dashboard for the AI-Based Intrusion Detection System. Connects 
 npm install
 npm start
 ```
-Dashboard available at `http://localhost:3000.`
 
-By default connects to  `http://localhost:5000.`
+The development dashboard is available at `http://localhost:3000` and uses the Create React App proxy to reach the backend at `http://localhost:5000`.
 
+For a production build:
 
-Override with:
-```Bash
-REACT_APP_SOCKET_URL=http://your-backend-host:5000 npm start
+```bash
+npm run build
 ```
----
+
+The frontend currently connects to Socket.IO with a relative URL (`io('/')`), so `REACT_APP_SOCKET_URL` is not a supported configuration variable.
+
 ## Pages
 
 | Page | File | Description |
 | :--- | :--- | :--- |
-| Dashboard | `pages/Dashboard.jsx` | Live alert feed, metric cards, traffic charts, socket connection |
-| Threat Intel | `pages/ThreatIntel.jsx` | Threat intelligence view |
-| History | `pages/History.jsx` | Historical alert log |
-| Settings | `pages/Settings.jsx` | System configuration |
+| Dashboard | `src/pages/Dashboard.jsx` | Live alerts, metrics, traffic charts, system health, and network devices |
+| Threat Intel | `src/pages/ThreatIntel.jsx` | Threat intelligence data and map view |
+| History | `src/pages/History.jsx` | Searchable and filterable alert history |
+| Settings | `src/pages/Settings.jsx` | IDS and system configuration |
 
----
 ## Structure
+
 ```
 src/
-├── App.jsx                        # Router + page mounting
+├── App.jsx                        # Router and page mounting
 ├── index.js                       # React entry point
 ├── components/
-│   ├── AlertTable.jsx             # Live alert log table
-│   ├── Charts.jsx                 # Alert volume over time (recharts)
-│   ├── MetricCard.jsx             # Stat card (total alerts, critical, high)
-│   ├── Navbar.jsx                 # Navigation bar
-│   └── TrafficCharts.jsx          # Attack traffic visualisation
+│   ├── AlertTable.jsx             # Alert log table
+│   ├── Charts.jsx                 # Alert charts
+│   ├── MetricCard.jsx             # Dashboard metric card
+│   ├── Navbar.jsx                 # Main navigation
+│   └── TrafficCharts.jsx          # Traffic visualisations
 ├── pages/
-│   ├── Dashboard.jsx              # Main dashboard, socket connection
+│   ├── Dashboard.jsx              # Main dashboard and live alerts
 │   ├── History.jsx                # Historical alerts
 │   ├── Settings.jsx               # Configuration panel
 │   └── ThreatIntel.jsx            # Threat intelligence
 └── styles/
-    ├── global.css                 # Design tokens (colours, fonts)
+    ├── global.css                 # Global styles and design tokens
     ├── Dashboard.css              # Dashboard layout
     ├── Navbar.css                 # Navigation styles
     └── Pages.css                  # Shared page styles
 ```
----
 
-## How Alerts Arrive
+## Data Flow
 
-1. Backend detects a threat → publishes to Redis `ids:alerts` stream.
-2. Flask Socket.IO bridge reads the stream → emits `new_alert` event.
-3. `Dashboard.jsx` receives the event → updates alert table and charts in real time.
+1. The frontend loads initial data from backend REST endpoints such as `/api/history`, `/api/health`, and `/api/network-devices`.
+2. The backend reads alerts from the Redis `ids:alerts` stream and emits live `new_alert` events through Flask-SocketIO.
+3. `Dashboard.jsx` and `History.jsx` receive those events and update their views without a page refresh.
 
----
+## Tests
+
+```bash
+npm test
+```
 
 ## Known Limitations
 
-* `public/alert.mp3` is a placeholder (0 bytes). Sound on CRITICAL alerts will not play until a real audio file is placed at that path. The failure is caught silently.
-* The "Session Alert Rate" metric is alerts-this-session / total-alerts-this-session, not a ground-truth detection rate. Real model metrics are in `backend/models/real_metrics.json`.
-* The `/api/dashboard` REST endpoint on the backend exists but is not currently wired into the UI. Only the WebSocket stream is used.
+* The UI uses REST endpoints for initial data and settings, and Socket.IO for live alert updates.
+* The session alert rate is a session-level UI metric, not a ground-truth model detection rate. Model metrics are documented by the backend.
