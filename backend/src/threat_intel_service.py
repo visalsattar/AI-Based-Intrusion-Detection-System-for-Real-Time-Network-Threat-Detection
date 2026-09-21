@@ -26,6 +26,7 @@ import json
 import time
 import logging
 import requests
+import ipaddress
 
 logger = logging.getLogger("IDS-ThreatIntel")
 
@@ -49,6 +50,11 @@ def _get_api_key(redis_client=None) -> str | None:
             logger.debug(f"Could not read AbuseIPDB key from settings: {e}")
     return None
 
+def _is_public(ip: str) -> bool:
+    try:
+        return ipaddress.ip_address(ip).is_global
+    except ValueError:
+        return False
 
 def lookup_ip(ip_address: str, redis_client=None, max_age_days: int = 90) -> dict:
     """
@@ -61,6 +67,10 @@ def lookup_ip(ip_address: str, redis_client=None, max_age_days: int = 90) -> dic
     """
     if not ip_address:
         return {"ip": ip_address, "status": "error", "error": "missing IP"}
+    
+    if not _is_public(ip_address):
+        return {"ip": ip_address, "abuse_score": None, "reports": None,
+            "isp": None, "domain": None, "last_reported": None, "status": "private"}
 
     cache_key = f"{CACHE_PREFIX}{ip_address}"
 
