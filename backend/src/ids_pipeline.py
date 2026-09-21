@@ -10,6 +10,7 @@ from redis import Redis
 import subprocess
 import json
 import time
+import ipaddress
 
 # Setting up logging for real-time monitoring[cite: 4]
 logging.basicConfig(level=logging.INFO)
@@ -24,6 +25,13 @@ def block_ip(ip):
     which is python:3.11-slim) and falls back to the Windows Firewall command
     when running directly on Windows during local development/demos.
     """
+    try:
+        if not ipaddress.ip_address(ip).is_global:
+            logger.warning(f"[IPS] Refusing to block non-public address {ip}")
+            return
+    except ValueError:
+        return
+
     system = platform.system().lower()
     try:
         if system == "linux":
@@ -68,7 +76,10 @@ class RealTimeIDSPipeline:
                  alert_threshold: float = 0.75,
                  packet_batch_size: int = 100,
                  flow_idle_timeout: float = 120.0,
-                 max_tracked_flows: int = 20000):
+                 max_tracked_flows: int = 20000,
+                 flow_max_duration: float = 120.0,
+                 max_packets_per_flow: int = 2000,
+                 batch_interval: float = 2.0):
         self.model_path = model_path
         self.alert_threshold = alert_threshold
         self.packet_batch_size = packet_batch_size
@@ -82,13 +93,19 @@ class RealTimeIDSPipeline:
         #     high-cardinality floods (e.g. spoofed-source DDoS/port scans)
         #     that create huge numbers of one-packet flows.
         self.flow_idle_timeout = flow_idle_timeout
+        self.flow_max_duration = flow_max_duration
+        self.max_packets_per_flow = max_packets_per_flow
+        self.batch_interval = batch_interval
+        self._last_batch_at = time.time()
         self.max_tracked_flows = max_tracked_flows
         self._last_eviction_at = 0.0
         
         try:
             # Redis connection logic for alert persistence[cite: 4]
             redis_host = os.environ.get('REDIS_HOST', 'redis')
-            self.redis_client = Redis(host=redis_host, port=6379, decode_responses=True)
+            self.redis_client = Redis(host=redis_host, port=6379,
+                          password=os.environ.get('REDIS_PASSWORD') or None,
+                          decode_responses=True)
             self.redis_client.ping()
             logger.info(f"Redis connected successfully (host={redis_host})")
         except Exception as e:
@@ -181,6 +198,7 @@ class RealTimeIDSPipeline:
         self.flow_tracker = {}
         self._settings_cache = {}
         self._settings_loaded_at = 0.0
+        self._last_alert = {}
 
     @staticmethod
     def _load_recon_threshold(model_path: str):
@@ -344,6 +362,7 @@ class RealTimeIDSPipeline:
                 'init_dport': dst_port,
                 'fwd_win': None,
                 'bwd_win': None,
+                'done':False,  # True once the flow has been scored and emitted
             }
         
         flow = self.flow_tracker[flow_key]
@@ -361,10 +380,27 @@ class RealTimeIDSPipeline:
 
         flow['packet_list'].append((packet, is_forward))
         
+        # Finished = FIN/RST seen or packet cap hit (age and idle are checked at scoring time).
+        if TCP in packet and (int(packet[TCP].flags) & 0x05):   # FIN=0x01, RST=0x04
+            flow['done'] = True
+        if flow['packets'] >= self.max_packets_per_flow:
+            flow['done'] = True
+        
         self.packet_buffer.append((flow_key, packet))
         
-        if len(self.packet_buffer) >= self.packet_batch_size:
+        if (len(self.packet_buffer) >= self.packet_batch_size
+                or time.time() - self._last_batch_at >= self.batch_interval):
             self._inference_batch()
+    
+    def _collect_finished_flows(self):
+        """Keys of flows ready to be scored exactly once."""
+        now = datetime.now()
+        return [
+            k for k, f in self.flow_tracker.items()
+            if f.get('done')
+            or (now - f['last_seen']).total_seconds() > self.flow_idle_timeout
+            or (now - f['first_seen']).total_seconds() >= self.flow_max_duration
+        ]
     
     def _inference_batch(self):
         """Batch inference for anomaly detection[cite: 4]."""
@@ -377,6 +413,9 @@ class RealTimeIDSPipeline:
         if not batch:
             return
         
+        self._last_batch_at = time.time()
+        finished = self._collect_finished_flows()
+        
         try:
             features_batch = []
             flow_keys_batch = []
@@ -385,9 +424,14 @@ class RealTimeIDSPipeline:
             # flow, so scoring once per *packet* would re-score the same flow N
             # times and emit N duplicate alerts. Score each unique flow once.
             seen_flows = set()
-            for flow_key, packet in batch:
+            for flow_key in finished:
+                features = self._extract_flow_features(flow_key)
+                if features is not None:
+                    features_batch.append(features)
+                    flow_keys_batch.append(flow_key)    
                 if flow_key in seen_flows:
                     continue
+                
                 seen_flows.add(flow_key)
                 features = self._extract_flow_features(flow_key)
                 if features is not None:
@@ -411,6 +455,14 @@ class RealTimeIDSPipeline:
             # of it). A poorly-reconstructed flow looks unlike anything the
             # model saw during training on benign traffic.
             recon_errors = np.mean(np.square(features_normalized - reconstructed), axis=1)
+
+            # Show the top 3 features that contributed to the reconstruction error
+            sq = np.square(features_normalized - reconstructed)
+            names = self.feature_scaler.feature_names_in_
+            for i, k in enumerate(flow_keys_batch):
+                top = np.argsort(sq[i])[-3:][::-1]
+                logger.info("TOPFEAT %s -> %s", k,
+                            ", ".join(f"{names[j]}={features_normalized[i, j]:.1f}" for j in top))
 
             # Supervised cross-check: the Random Forest scores the exact same
             # scaled 78-feature vectors and returns P(attack) per flow. Left as
@@ -448,9 +500,9 @@ class RealTimeIDSPipeline:
         except Exception as e:
             logger.error(f"Inference batch error: {e}")
         finally:
-            # Reclaim finished/stale flows every batch so the table stays
-            # bounded even under a long capture or a high-cardinality flood.
-            # In finally so eviction still runs if scoring raised above.
+            # scored flows are finished; never re-score them
+            for k in finished:              
+                self.flow_tracker.pop(k, None)
             self._evict_stale_flows()
 
     def _extract_flow_features(self, flow_key: Tuple) -> np.ndarray:
@@ -550,6 +602,10 @@ class RealTimeIDSPipeline:
         fwd_flags = _flag_counts(fwd_pkts)
         bwd_flags = _flag_counts(bwd_pkts)
         all_flags = _flag_counts(all_pkts_only)
+        
+        # CICIDS stores the *Flag Count columns as 0/1 indicators (scaler range == 1),
+        # not packet counts. Emit presence, not count.
+        all_flags = {k: min(v, 1) for k, v in all_flags.items()}
 
         def _ip_header_len(p):
             # IP header length (4-byte words -> bytes) + TCP/UDP header length
@@ -741,6 +797,14 @@ class RealTimeIDSPipeline:
         # override_reason already boosted anomaly_score above, so this single
         # gate covers both the averaged case and the single-model overrides.
         if anomaly_score > self.alert_threshold:
+            k = (src_ip, flow['init_dst'], flow['init_dport'])
+            now = time.time()
+            if now - self._last_alert.get(k, 0) < 60:
+                return
+            self._last_alert[k] = now
+            if len(self._last_alert) > 10000:
+                self._last_alert = {a: t for a, t in self._last_alert.items() if t > now - 60}
+                 
             severity = self._compute_severity(anomaly_score, settings)
             
             alert_payload = {
@@ -774,7 +838,15 @@ class RealTimeIDSPipeline:
             
             if self.redis_client:
                 try:
-                    self.redis_client.xadd('ids:alerts', {'data': json.dumps(alert_payload)})
+                    alert_stream = {'data': json.dumps(alert_payload)}
+                    try:
+                        self.redis_client.xadd(
+                            'ids:alerts', alert_stream, maxlen=5000, approximate=True
+                        )
+                    except TypeError:
+                        # Support lightweight Redis-compatible clients that do not
+                        # expose optional stream trimming arguments.
+                        self.redis_client.xadd('ids:alerts', alert_stream)
                 except Exception as e:
                     logger.warning(f"Redis failed: {e}")
 
@@ -821,7 +893,8 @@ class RealTimeIDSPipeline:
                 iface=interface if interface and interface != 'auto' else None,
                 prn=self.packet_callback,
                 store=False,
-                count=packet_count
+                count=packet_count, 
+                filter="(tcp or udp) and not port 6379" # Exclude Redis traffic to avoid self-capture
             )
         except Exception as e:
             logger.error(f"Packet capture error: {e}")
