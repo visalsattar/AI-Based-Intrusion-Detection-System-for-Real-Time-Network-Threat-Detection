@@ -275,6 +275,7 @@ const Settings = () => {
               onChange={(e) => update({ abuseIPDBKey: e.target.value })}
               className="search-input"
               style={{ width: '100%' }}
+              autoComplete="new-password"
             />
           </div>
         </div>
@@ -315,7 +316,7 @@ const Settings = () => {
           <h3><Info size={13} style={{ marginRight: 6, verticalAlign: '-2px' }} />System Information</h3>
           <div className="settings-grid" style={{ gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
             <div className="summary-card">
-              <span className="label">Model Status</span>
+              <span className="label">Autoencoder accuracy (offline)</span>
               <span className={`value ${modelStatus?.status === 'ready' ? 'ok' : 'warn'}`} style={{ fontSize: modelStatus?.status === 'ready' ? 20 : 13 }}>
                 {modelStatus?.status === 'ready'
                   ? (modelStatus.accuracy != null ? `${(modelStatus.accuracy * 100).toFixed(1)}%` : 'Calibrated')
