@@ -2,9 +2,17 @@
 # Build context is the project root (docker-compose.yml -> context: .)
 # so this file must live here, not in backend/, for Docker to respect it.
 
-# --- Secrets: never baked into an image layer ---
-backend/.env
-backend/.env.local
+# --- Secrets: never sent to the Docker build context ---
+.env
+*.env
+.env.*
+*.env.local
+
+# --- Secrets: never sent to Docker build context ---
+.env
+*.env
+.env.*
+*.env.local
 
 # --- Backend dev junk, not needed inside the image ---
 backend/__pycache__/
