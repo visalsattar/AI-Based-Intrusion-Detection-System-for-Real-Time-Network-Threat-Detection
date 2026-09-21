@@ -85,11 +85,12 @@ def _connect_redis(max_attempts=5, base_delay=1.5):
     That's a timing race, not a real outage, so it's worth a few
     short retries before giving up.
     """
-    host = os.environ.get('REDIS_HOST', 'redis')
+    host = os.environ.get('REDIS_HOST', 'localhost')
     log = logging.getLogger("IDS-Orchestrator")
     for attempt in range(1, max_attempts + 1):
         try:
-            client = Redis(host=host, port=6379, decode_responses=True, socket_connect_timeout=2)
+            client = Redis(host=host, port=6379, password=os.environ.get('REDIS_PASSWORD') or None,
+                decode_responses=True, socket_connect_timeout=2)
             client.ping()
             if attempt > 1:
                 log.info(f"Redis connected on attempt {attempt}/{max_attempts}.")
@@ -157,11 +158,14 @@ def resolve_interface(requested: str) -> str:
     return requested or 'eth0'
 
 # 7. Enterprise-Grade Logging Configuration
+# Create logs/ before FileHandler tries to open the file — setup_environment()
+# runs later, but the handler is instantiated here at import time.
+Path(os.path.join(BASE_DIR, 'logs')).mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] [%(name)s] [%(levelname)s] - %(message)s',
     handlers=[
-        logging.FileHandler('logs/ids.log'),
+        logging.FileHandler(os.path.join(BASE_DIR, 'logs', 'ids.log')),
         logging.StreamHandler(sys.stdout)
     ]
 )
@@ -238,7 +242,8 @@ def run_ids_capture(interface: str):
             model_path=model_path,
             feature_extractor_path=scaler_path,
             alert_threshold=0.85,
-            packet_batch_size=50
+            packet_batch_size=50,
+            flow_idle_timeout=15.0,
         )
         ids.start_capture(interface=resolved)
     except PermissionError as e:
