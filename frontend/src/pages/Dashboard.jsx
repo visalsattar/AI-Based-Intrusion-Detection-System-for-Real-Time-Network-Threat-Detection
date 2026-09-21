@@ -135,9 +135,9 @@ const Dashboard = () => {
     const handleNewAlert = (alert) => {
       setAlerts(prev => mergeAlerts(prev, alert));
       if (alert.severity === 'CRITICAL') {
-        new Audio('/critical.mp3').play().catch(() => {});
+        new Audio('/1critical.mp3').play().catch(() => {});
       } else if (alert.severity === 'HIGH') {
-        new Audio('/high.mp3').play().catch(() => {});
+        new Audio('/2high.mp3').play().catch(() => {});
       }
     };
 
