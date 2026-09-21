@@ -1,47 +1,37 @@
 services:
-  # 1. The Redis Database
   redis:
     image: redis:alpine
-    command: redis-server --protected-mode no
+    command: redis-server --requirepass ${REDIS_PASSWORD:?set REDIS_PASSWORD in root .env}
+    environment:
+      - REDISCLI_AUTH=${REDIS_PASSWORD}
     ports:
-      - "6380:6379"
+      - "127.0.0.1:6380:6379"
     restart: always
     healthcheck:
-      # Confirms Redis is actually accepting connections, not just that
-      # the container process has started. 'depends_on' alone only waits
-      # for the container to start, which is what caused the DNS-lookup
-      # race in main.py's _connect_redis() -- the backend would start
-      # trying to resolve 'redis' before Redis itself was really ready.
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
       interval: 2s
       timeout: 2s
       retries: 10
       start_period: 5s
 
-  # 2. The Unified Web Dashboard & API (Flask + React, built in one image)
   backend:
     build:
       context: .
       dockerfile: backend/Dockerfile
+      args:
+        REACT_APP_CARTO_KEY: ${REACT_APP_CARTO_KEY:-}
     ports:
-      - "3000:5000"
+      - "127.0.0.1:5000:5000"
     env_file:
-      # Optional: copy backend/.env.example -> backend/.env and fill in your
-      # API keys. The system runs without it; only AbuseIPDB threat-intel
-      # lookups will be unavailable if the key is missing.
       - path: ./backend/.env
         required: false
     environment:
       - REDIS_HOST=redis
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
       - AUTO_CAPTURE=true
     cap_add:
-      # Required for Scapy to actually open a raw capture socket.
-      # Without these, real packet capture silently fails to bind --
-      # the dashboard would run, but never see real traffic.
       - NET_ADMIN
       - NET_RAW
-    cap_drop:
-      - ALL  
     restart: unless-stopped
     depends_on:
       redis:
