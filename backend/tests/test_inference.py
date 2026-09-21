@@ -59,6 +59,10 @@ def pipeline():
     )
     return ids
 
+@pytest.fixture(autouse=True)
+def _reset_alert_cooldown(pipeline):
+    pipeline._last_alert.clear()
+
 
 def _make_flow(pipeline, src="10.0.0.5", dst="10.0.0.9", sport=44444, dport=80, n=4):
     """Register a synthetic TCP flow directly in the pipeline's flow_tracker."""
@@ -253,3 +257,18 @@ def test_rf_override_confirms_known_attack(pipeline):
     assert len(alerts) == 1, "RF override failed to fire on a known-attack pattern"
     assert "random forest override" in alerts[0]["detection_source"]
     assert alerts[0]["anomaly_score"] == pytest.approx(0.95, abs=1e-6)
+
+def test_cooldown_suppresses_duplicate_alerts(pipeline):
+    pipeline.redis_client = FakeRedis()
+    key = _make_flow(pipeline)
+    pipeline._process_prediction(key, recon_error=1.0, rf_attack_prob=None)
+    pipeline._process_prediction(key, recon_error=1.0, rf_attack_prob=None)
+    assert len(pipeline.redis_client.alerts()) == 1
+
+def test_done_flow_is_scored_once_and_removed(pipeline):
+    pipeline.redis_client = FakeRedis()
+    key = _make_flow(pipeline)
+    pipeline.flow_tracker[key]['done'] = True
+    pipeline.packet_buffer.append((key, None))
+    pipeline._inference_batch()
+    assert key not in pipeline.flow_tracker
