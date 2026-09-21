@@ -7,7 +7,7 @@ Python backend handling packet capture, AI inference, alert streaming, and the F
 ## Model Performance (CICIDS2017 Friday DDoS — held-out test set)
 
 | Model | Accuracy | Precision | Recall | F1 |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | Autoencoder | — | — | — | ROC-AUC 0.79 |
 | Random Forest | 99.75% | 99.26% | 99.74% | **99.50%** |
 | CNN | 99.76% | 99.12% | 99.91% | **99.51%** |
@@ -22,39 +22,48 @@ Random Forest false positive rate: **0.25%** (84 / 33,790 benign flows).
 ```bash
 pip install -r requirements.txt
 ```
+
 CommandsPreprocess dataset:Bashpython main.py --mode preprocess --dataset "data/<cicids-file>.csv" --multiclass
 Train models:
+
 ```Bash
 python run_training.py
 ```
+
 Use this, not main.py --mode train — avoids a Windows joblib deadlock caused by Flask/SocketIO loading during cross-validation.
 
 Evaluate metrics:
-```Bash
+
+```bash
 python src/model_evaluation.py data/preprocessed/CICIDS2017_cleaned.csv
 ```
 
 Run Flask server:
-```Bash
+
+```bash
 python main.py
 ```
 
 Verify end-to-end pipeline:
-```Bash
+
+```bash
 python verify_ensemble.py
 ```
 
 Calibrate override thresholds:
-```Bash
+
+```bash
 python src/calibrate_override.py
 ```
 
-Tests
-```Bash
+Tests:
+
+```bash
 python -m pytest tests/ -v
 ```
 
 ## Automated Test Metrics
+
 | File | Count | Covers |
 | :--- | :---: | :--- |
 | `test_preprocessing.pY` | 4 | Inf removal, MinMax range, label encoding, text column drop |
@@ -64,6 +73,7 @@ python -m pytest tests/ -v
 | `test_proposed_block_queue.py` | 1 | Confirms a proposed IP-block queue writes to Redis via xadd (inferred from test name — verify against actual file) |
 
 Structure
+
 ```
 backend/
 ├── main.py                      # Flask server + IDS entry point
@@ -99,7 +109,7 @@ backend/
 
 ## Known Limitations
 
-* Live feature extraction covers ~24 of 78 CICIDS2017 features; remaining are zero-filled. 
+* Live feature extraction covers ~24 of 78 CICIDS2017 features; remaining are zero-filled.
 * RF classifies real CICIDS2017 vectors correctly but predicts Benign on Scapy-captured flows.
 * The AE override handles live detection for those cases.
 * CNN is offline-only — requires 100-flow ordered windows unavailable in per-flow live capture.
