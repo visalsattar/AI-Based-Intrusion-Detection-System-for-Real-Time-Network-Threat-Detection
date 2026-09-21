@@ -14,6 +14,8 @@ echo Building images and starting Redis + Backend...
 echo (First run takes a few minutes - installs npm packages,
 echo  builds the React app, and installs Python dependencies.)
 echo.
+echo Once started, open your browser at: http://localhost:5000
+echo.
 
 docker-compose up --build
 
