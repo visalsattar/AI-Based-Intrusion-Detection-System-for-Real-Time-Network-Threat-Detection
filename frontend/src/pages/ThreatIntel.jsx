@@ -16,6 +16,8 @@ import { MapContainer, TileLayer, CircleMarker, Popup } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 
 const SEVERITY_COLOR = { CRITICAL: '#EF4444', HIGH: '#F59E0B', MEDIUM: '#38BDF8' };
+const CARTO_KEY = process.env.REACT_APP_CARTO_KEY;
+const TILE_URL = `https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png${CARTO_KEY ? `?key=${CARTO_KEY}` : ''}`;
 
 const formatTimestamp = (ts) => {
   if (!ts) return '—';
@@ -25,6 +27,9 @@ const formatTimestamp = (ts) => {
 };
 
 const ScoreBadge = ({ record }) => {
+  if (record.intel_status === 'private') {
+    return <span className="status-pill not-configured">Private</span>;
+  }
   if (record.intel_status === 'not_configured') {
     return <span className="status-pill not-configured">Not configured</span>;
   }
@@ -107,8 +112,10 @@ const ThreatIntel = () => {
           <MapContainer center={[20, 10]} zoom={1.5} minZoom={1.5} worldCopyJump
             style={{ height: '100%', width: '100%', background: '#0B0E14' }}>
             <TileLayer
-              url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
-              attribution='&copy; <a href="https://carto.com/attributions">CARTO</a>'
+              url={TILE_URL}
+              attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>, &copy; <a href="https://carto.com/attributions">CARTO</a>'
+              subdomains="abcd"
+              maxZoom={20}
             />
             {mappable.map((r) => (
               <CircleMarker
