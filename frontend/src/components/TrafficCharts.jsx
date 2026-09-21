@@ -69,6 +69,7 @@ export const AttackDonut = ({ alerts = [] }) => {
               paddingAngle={3}
               dataKey="value"
               stroke="none"
+              isAnimationActive={false}
             >
               {data.map((entry) => (
                 <Cell key={entry.name} fill={CATEGORY_COLORS[entry.name] || CATEGORY_COLORS.Other} />
@@ -115,12 +116,12 @@ export const NetworkTrafficChart = ({ alerts = [] }) => {
 
   return (
     <div className="chart-container">
-      <h3>Threat Activity (per minute)</h3>
+      <h3>Threat Activity (per 10 s)</h3>
       {data.length === 0 ? (
         <EmptyChartState label={"No alerts yet —\nthis chart populates as real detections arrive."} />
       ) : (
         <ResponsiveContainer width="100%" height="100%">
-          <AreaChart data={data} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
+          <AreaChart data={data} margin={{ top: 10, right: 20, left: 0, bottom: 0 }} isAnimationActive={false}>
             <defs>
               <linearGradient id="colorAlerts" x1="0" y1="0" x2="0" y2="1">
                 <stop offset="5%" stopColor="#EF4444" stopOpacity={0.35} />
