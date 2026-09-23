@@ -145,7 +145,7 @@ const Settings = () => {
           <div className="setting-item">
             <div>
               <label>Detection Sensitivity</label>
-              <span className="setting-hint">Adjust how aggressively the system detects threats</span>
+              <span className="setting-hint">High lowers the alert cutoff and can increase false positives; Low raises it.</span>
             </div>
             <select value={settings.sensitivity} onChange={(e) => update({ sensitivity: e.target.value })}>
               <option value="low">Low (Fewer alerts)</option>
@@ -157,7 +157,7 @@ const Settings = () => {
           <div className="setting-item">
             <div>
               <label>Network Interface</label>
-              <span className="setting-hint">Select which real network interface to monitor</span>
+              <span className="setting-hint">Docker lists eth0/lo here. Host capture uses the adapter selected by start-capture.ps1.</span>
             </div>
             <select value={settings.networkInterface} onChange={(e) => update({ networkInterface: e.target.value })}>
               <option value="auto">Auto-detect</option>
