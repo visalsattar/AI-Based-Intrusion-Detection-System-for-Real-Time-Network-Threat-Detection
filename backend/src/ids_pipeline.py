@@ -14,6 +14,7 @@ import ipaddress
 import threading
 
 from redis_util import make_redis
+from threat_evidence import save_threat_evidence
 
 # Setting up logging for real-time monitoring[cite: 4]
 # NOTE: no logging.basicConfig() here. A basicConfig at import time runs before main.py's own
@@ -22,6 +23,26 @@ from redis_util import make_redis
 logger = logging.getLogger(__name__)
 
 import platform
+
+def _load_whitelist(config_path=None) -> set:
+    """Combine IDS_WHITELIST with a local JSON whitelist; validate every address."""
+    values = {x.strip() for x in os.environ.get("IDS_WHITELIST", "").split(",") if x.strip()}
+    path = config_path or os.path.join(os.path.dirname(__file__), "..", "config", "whitelist.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            values.update(str(x).strip() for x in json.load(f).get("whitelist", []) if str(x).strip())
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning(f"Could not load whitelist {path}: {e}")
+    valid = set()
+    for value in values:
+        try:
+            valid.add(str(ipaddress.ip_address(value)))
+        except ValueError:
+            logger.warning(f"Ignoring invalid whitelist IP: {value!r}")
+    return valid
+
 
 def _local_ips() -> set:
     """IPv4 addresses on this host's interfaces (tells inbound from outbound flows)."""
@@ -264,8 +285,7 @@ class RealTimeIDSPipeline:
         self._blocked = {}             # ip -> unblock-at epoch
         self._local_ips = _local_ips()
         self._local_ips_at = time.time()
-        self._whitelist = {x.strip() for x in os.environ.get("IDS_WHITELIST", "").split(",")
-                           if x.strip()}
+        self._whitelist = _load_whitelist()
         self._stop = threading.Event()
         # IDS_DUMP_FEATURES=<file.csv>: append every scored flow's RAW 78 features plus the
         # autoencoder error and RF probability, for tools/skew_report.py. Off by default.
@@ -978,6 +998,12 @@ class RealTimeIDSPipeline:
                 'suppressed_since_last': suppressed,
             }
             
+            # Save thesis evidence before publishing; evidence errors must not drop alerts.
+            try:
+                alert_payload.update(save_threat_evidence(alert_payload))
+            except Exception as e:
+                logger.warning(f"Could not save threat evidence snapshot: {e}")
+
             if self.redis_client:
                 try:
                     self.redis_client.xadd(
