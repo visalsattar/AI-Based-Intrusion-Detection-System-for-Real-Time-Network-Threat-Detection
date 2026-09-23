@@ -1,4 +1,4 @@
-# AI based Intrusion Detection System for Real-Time Network Threat Detection
+# AI-Based Intrusion Detection System (IDS)
 
 Final Year Project — BS Computer Science, The University of Agriculture, Peshawar
 
@@ -17,7 +17,7 @@ Traditional network security relies on signature-based detection — a list of k
 - Real dataset — 225,745 actual network flows (CICIDS2017), not toy data
 - Full stack — AI + backend + frontend + Docker + CI all working together
 - Honest reporting — the Autoencoder's weaker standalone performance is disclosed, not hidden
-- 22 automated tests, including a regression test for train/test leakage
+- Automated tests cover preprocessing, flow scoring, route security, threat-intel privacy, and train/test leakage
 - Redis Streams, WebSockets, and Docker health checks for the live pipeline
 
 ---
@@ -123,7 +123,13 @@ cd frontend
 npm start
 ```
 
-Dashboard available at `http://localhost:3000`.
+Dashboard available at localhost:3000 for React development (Docker serves it at localhost:5000).
+
+**Live capture on Windows with Docker Desktop**
+
+Start Redis and the dashboard with docker compose up --build. In another PowerShell window run ./start-capture.ps1; it requests Administrator access and connects host-side Scapy to Docker Redis. Npcap must be installed. Keep the capture window open. Only flows above the alert threshold appear in Threat Intel.
+
+The AbuseIPDB credential previously committed to GitHub must be revoked and replaced. Put the replacement in backend/.env as ABUSEIPDB_API_KEY=... . The Settings page no longer submits or stores the key. Removing it from current files does not remove it from old Git commits.
 
 **Verify the full pipeline**
 
