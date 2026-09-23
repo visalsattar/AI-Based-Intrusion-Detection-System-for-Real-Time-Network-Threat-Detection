@@ -36,13 +36,14 @@ import time
 import argparse
 import logging
 import threading
+import secrets
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 # 3. Third-Party Imports
 import numpy as np
 from flask import Flask, send_from_directory
 from flask_socketio import SocketIO
-from redis import Redis
 from dotenv import load_dotenv
 
 # Load backend/.env (if present) BEFORE anything reads os.environ, so
@@ -63,13 +64,17 @@ from ai_model_development import HybridIDSModel, train_hybrid_ids_model
 from ids_pipeline import RealTimeIDSPipeline
 from redis_alert_bridge import start_redis_alert_bridge
 from network_utils import list_interfaces
-from routes import register_routes
+from redis_util import make_redis
+from routes import register_routes, allowed_origins
 
 # 6. Global Application Initialization
 # Initialize Flask using the absolute path to the React frontend
 app = Flask(__name__, static_folder=FRONTEND_DIR, static_url_path=None)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-key')
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+# No guessable fallback: an unset SECRET_KEY becomes a random per-process key.
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY') or secrets.token_hex(32)
+# Same allow-list the REST guard uses (IDS_ALLOWED_ORIGINS); "*" let any web page a user
+# happened to visit open a socket to the dashboard and read live alerts.
+socketio = SocketIO(app, cors_allowed_origins=allowed_origins(), async_mode='eventlet')
 
 # Optional Redis connection. All alert data — real or none — flows through
 # the 'ids:alerts' stream, written by RealTimeIDSPipeline once packet
@@ -85,12 +90,11 @@ def _connect_redis(max_attempts=5, base_delay=1.5):
     That's a timing race, not a real outage, so it's worth a few
     short retries before giving up.
     """
-    host = os.environ.get('REDIS_HOST', 'localhost')
+    host = f"{os.environ.get('REDIS_HOST', 'localhost')}:{os.environ.get('REDIS_PORT', '6379')}"
     log = logging.getLogger("IDS-Orchestrator")
     for attempt in range(1, max_attempts + 1):
         try:
-            client = Redis(host=host, port=6379, password=os.environ.get('REDIS_PASSWORD') or None,
-                decode_responses=True, socket_connect_timeout=2)
+            client = make_redis()          # shared with ids_pipeline.py: host/port/password
             client.ping()
             if attempt > 1:
                 log.info(f"Redis connected on attempt {attempt}/{max_attempts}.")
@@ -165,7 +169,9 @@ logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] [%(name)s] [%(levelname)s] - %(message)s',
     handlers=[
-        logging.FileHandler(os.path.join(BASE_DIR, 'logs', 'ids.log')),
+        # Rotating: the pipeline logs every scored flow at INFO; a plain FileHandler grows forever.
+        RotatingFileHandler(os.path.join(BASE_DIR, 'logs', 'ids.log'),
+                            maxBytes=5 * 1024 * 1024, backupCount=3),
         logging.StreamHandler(sys.stdout)
     ]
 )
@@ -233,7 +239,7 @@ def run_ids_capture(interface: str):
         logger.error(
             "Cannot start packet capture — trained model artifacts are missing "
             f"({model_path}, {scaler_path}). Run `python main.py --mode preprocess --dataset <csv>` "
-            "then `python main.py --mode train` first."
+            "then `python run_training.py` first (or download the release models, see README)."
         )
         return
 
@@ -243,7 +249,11 @@ def run_ids_capture(interface: str):
             feature_extractor_path=scaler_path,
             alert_threshold=0.85,
             packet_batch_size=50,
-            flow_idle_timeout=15.0,
+            # The CICIDS2017 authors report a 120 s flow timeout. A shorter idle timeout
+            # chops long-lived connections into fragments the models never saw in training,
+            # so 15 s trades detection latency for a train/serve mismatch. Measure before
+            # lowering it further.
+            flow_idle_timeout=float(os.environ.get('FLOW_IDLE_TIMEOUT', '15')),
         )
         ids.start_capture(interface=resolved)
     except PermissionError as e:
@@ -285,9 +295,11 @@ def run_production_dashboard():
             "or run `python main.py --mode ids --interface <name>` as a separate process."
         )
 
+    # Loopback by default. The Docker image sets IDS_BIND=0.0.0.0 and compose publishes the
+    # port on 127.0.0.1 only; opening it to the LAN should be a deliberate choice.
     socketio.run(
-        app, 
-        host='0.0.0.0', 
+        app,
+        host=os.environ.get('IDS_BIND', '127.0.0.1'),
         port=5000, 
         debug=False, 
         allow_unsafe_werkzeug=True
