@@ -178,6 +178,9 @@ class RealTimeIDSPipeline:
         self.block_ttl = block_ttl
         self.sweep_interval = sweep_interval
         self._last_batch_at = time.time()
+        self._capture_health_at = time.monotonic()
+        self._capture_packets = 0
+        self._capture_ipv4_transport_packets = 0
         self.max_tracked_flows = max_tracked_flows
         self._last_eviction_at = 0.0
         
@@ -418,6 +421,9 @@ class RealTimeIDSPipeline:
     def packet_callback(self, packet):
         """Scapy callback for each captured packet."""
         with self._lock:
+            self._capture_packets += 1
+            if IP in packet and (TCP in packet or UDP in packet):
+                self._capture_ipv4_transport_packets += 1
             self._ingest(packet)
             if (len(self.packet_buffer) >= self.packet_batch_size
                     or time.time() - self._last_batch_at >= self.batch_interval):
@@ -645,10 +651,20 @@ class RealTimeIDSPipeline:
             self._inference_batch()
 
     def _tick_once(self):
-        """Time-driven flush: idle/expired flows must be scored even if no packet arrives."""
+        """Flush idle flows and periodically report whether capture receives packets."""
         with self._lock:
             if time.time() - self._last_batch_at >= self.batch_interval:
                 self._inference_batch()
+            now = time.monotonic()
+            if now - self._capture_health_at >= 10.0:
+                logger.info(
+                    "CAPTURE_HEALTH packets=%d ipv4_tcp_udp=%d tracked_flows=%d buffered_packets=%d",
+                    self._capture_packets, self._capture_ipv4_transport_packets,
+                    len(self.flow_tracker), len(self.packet_buffer),
+                )
+                self._capture_packets = 0
+                self._capture_ipv4_transport_packets = 0
+                self._capture_health_at = now
 
     def _ticker(self):
         while not self._stop.wait(self.batch_interval):
@@ -656,6 +672,12 @@ class RealTimeIDSPipeline:
                 self._tick_once()
             except Exception as e:
                 logger.error(f"Flush ticker error: {e}", exc_info=True)
+
+    def _capture_heartbeat(self):
+        """Report capture process liveness without taking the inference lock."""
+        logger.info("CAPTURE_HEARTBEAT started")
+        while not self._stop.wait(10.0):
+            logger.info("CAPTURE_HEARTBEAT alive")
 
     def _extract_flow_features(self, flow_key: Tuple) -> np.ndarray:
         """
@@ -1107,6 +1129,7 @@ class RealTimeIDSPipeline:
         logger.info(f"Starting packet capture on {interface} (filter: {bpf})")
         self._stop.clear()
         threading.Thread(target=self._ticker, daemon=True, name="ids-flush-ticker").start()
+        threading.Thread(target=self._capture_heartbeat, daemon=True, name="ids-capture-heartbeat").start()
         try:
             sniff(
                 iface=interface if interface and interface != 'auto' else None,
