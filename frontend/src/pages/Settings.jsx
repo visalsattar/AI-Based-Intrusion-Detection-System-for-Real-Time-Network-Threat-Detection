@@ -26,7 +26,6 @@ const DEFAULT_SETTINGS = {
   geolocationEnabled: true,
   threatIntelEnabled: true,
   autoBlock: false,
-  abuseIPDBKey: '',
   abuseIPDBKeySet: false,
   criticalThreshold: 0.95,
   highThreshold: 0.85,
@@ -81,15 +80,19 @@ const Settings = () => {
     setSaveState(null);
     try {
       await axios.post('/api/save-settings', settings);
-      setSaveState('success');
+      setSaveState({ type: 'success' });
       await loadAll(); // refresh masked key state / system info
     } catch (e) {
-    console.error('Failed to save settings:', e);
-    const msg = e.response?.data?.message || e.response?.statusText || 'Check backend connectivity.';
-    setSaveState(`error:${msg}`);
+      console.error('Failed to save settings:', e);
+      // The backend (routes.py validate_settings) returns a per-field `errors` array on 400,
+      // e.g. ["highThreshold: must be lower than criticalThreshold"] -- show that verbatim
+      // instead of a generic failure message.
+      const detail = e.response?.data?.errors?.join('; ');
+      const msg = detail || e.response?.data?.message || e.response?.statusText || 'Check backend connectivity.';
+      setSaveState({ type: 'error', message: msg });
     } finally {
       setSaving(false);
-      setTimeout(() => setSaveState(null), 4000);
+      setTimeout(() => setSaveState(null), 6000);
     }
   };
 
@@ -255,29 +258,11 @@ const Settings = () => {
         {/* ---------------- Threat Intelligence (AbuseIPDB) ---------------- */}
         <div className="settings-card">
           <h3><Database size={13} style={{ marginRight: 6, verticalAlign: '-2px' }} />Threat Intelligence</h3>
-
-          <div className="setting-item" style={{ flexDirection: 'column', alignItems: 'stretch', gap: 8 }}>
-            <div>
-              <label>AbuseIPDB API Key</label>
-              <span className="setting-hint">
-                {settings.abuseIPDBKeySet ? 'A key is already sved — leave blank to keep it.' : (
-                  <>Get a free key at{' '}
-                    <a href="https://www.abuseipdb.com" target="_blank" rel="noreferrer" style={{ color: 'var(--data)' }}>
-                      abuseipdb.com
-                    </a> to enable threat intelligence.</>
-                )}
-              </span>
-            </div>
-            <input
-              type="password"
-              placeholder={settings.abuseIPDBKeySet ? '••••••••••••••••••••' : 'Paste your AbuseIPDB API key'}
-              value={settings.abuseIPDBKey}
-              onChange={(e) => update({ abuseIPDBKey: e.target.value })}
-              className="search-input"
-              style={{ width: '100%' }}
-              autoComplete="new-password"
-            />
-          </div>
+          <p className="page-subtext">
+            {settings.abuseIPDBKeySet
+              ? 'AbuseIPDB is configured from the backend environment.'
+              : 'Set ABUSEIPDB_API_KEY in backend/.env and restart the backend to enable AbuseIPDB lookups.'}
+          </p>
         </div>
 
         {/* ---------------- Geolocation Database ---------------- */}
@@ -351,8 +336,8 @@ const Settings = () => {
           {saving ? 'Saving…' : 'Save Configuration'}
         </button>
         <button className="action-btn" onClick={exportLogs}>Export Logs</button>
-        {saveState === 'success' && <span className="save-confirmation">Configuration updated successfully.</span>}
-        {saveState === 'error' && <span className="save-confirmation error">Failed to save. Check backend connectivity.</span>}
+        {saveState?.type === 'success' && <span className="save-confirmation">Configuration updated successfully.</span>}
+        {saveState?.type === 'error' && <span className="save-confirmation error">Failed to save: {saveState.message}</span>}
       </div>
     </div>
   );
