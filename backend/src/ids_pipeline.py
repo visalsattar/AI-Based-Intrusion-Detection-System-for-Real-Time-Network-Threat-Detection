@@ -947,10 +947,20 @@ class RealTimeIDSPipeline:
                 f"packets={flow['packets']} bytes={flow['bytes']} src={src_ip}"
             )
 
-        # Alert if the (possibly override-boosted) score clears the bar. The
-        # override_reason already boosted anomaly_score above, so this single
-        # gate covers both the averaged case and the single-model overrides.
-        if anomaly_score > self.alert_threshold:
+        # Sensitivity changes the minimum anomaly score needed to emit an alert.
+        # Severity thresholds below still decide the label (MEDIUM/HIGH/CRITICAL).
+        sensitivity_cutoffs = {
+            "low": min(0.99, self.alert_threshold + 0.10),
+            "medium": self.alert_threshold,
+            "high": max(0.50, self.alert_threshold - 0.15),
+        }
+        alert_cutoff = sensitivity_cutoffs.get(
+            settings.get("sensitivity", "medium"), self.alert_threshold
+        )
+
+        # The override_reason already boosted anomaly_score above, so this gate
+        # covers both the averaged case and the single-model overrides.
+        if anomaly_score > alert_cutoff:
             severity = self._compute_severity(anomaly_score, settings)
 
             # Cooldown per (source, severity) -- NOT per destination port: a port scan
