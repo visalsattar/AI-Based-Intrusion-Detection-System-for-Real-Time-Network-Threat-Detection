@@ -283,6 +283,7 @@ class RealTimeIDSPipeline:
         self._settings_loaded_at = 0.0
         self._last_alert = {}          # (src_ip, severity) -> (last_alert_ts, suppressed_count)
         self._lock = threading.RLock() # sniff callback and the flush ticker share flow state
+        self._capture_counter_lock = threading.Lock()
         self._done = set()             # flow keys flagged finished (FIN/RST/packet cap)
         self._last_sweep_at = 0.0
         self._blocked = {}             # ip -> unblock-at epoch
@@ -420,10 +421,11 @@ class RealTimeIDSPipeline:
 
     def packet_callback(self, packet):
         """Scapy callback for each captured packet."""
-        with self._lock:
+        with self._capture_counter_lock:
             self._capture_packets += 1
             if IP in packet and (TCP in packet or UDP in packet):
                 self._capture_ipv4_transport_packets += 1
+        with self._lock:
             self._ingest(packet)
             if (len(self.packet_buffer) >= self.packet_batch_size
                     or time.time() - self._last_batch_at >= self.batch_interval):
@@ -652,19 +654,33 @@ class RealTimeIDSPipeline:
 
     def _tick_once(self):
         """Flush idle flows and periodically report whether capture receives packets."""
-        with self._lock:
-            if time.time() - self._last_batch_at >= self.batch_interval:
-                self._inference_batch()
-            now = time.monotonic()
-            if now - self._capture_health_at >= 10.0:
-                logger.info(
-                    "CAPTURE_HEALTH packets=%d ipv4_tcp_udp=%d tracked_flows=%d buffered_packets=%d",
-                    self._capture_packets, self._capture_ipv4_transport_packets,
-                    len(self.flow_tracker), len(self.packet_buffer),
-                )
+        now = time.monotonic()
+        if now - self._capture_health_at >= 10.0:
+            with self._capture_counter_lock:
+                packets = self._capture_packets
+                ipv4_transport = self._capture_ipv4_transport_packets
                 self._capture_packets = 0
                 self._capture_ipv4_transport_packets = 0
                 self._capture_health_at = now
+
+            if self._lock.acquire(blocking=False):
+                try:
+                    tracked_flows = len(self.flow_tracker)
+                    buffered_packets = len(self.packet_buffer)
+                finally:
+                    self._lock.release()
+            else:
+                tracked_flows = -1
+                buffered_packets = -1
+
+            logger.info(
+                "CAPTURE_HEALTH packets=%d ipv4_tcp_udp=%d tracked_flows=%d buffered_packets=%d",
+                packets, ipv4_transport, tracked_flows, buffered_packets,
+            )
+
+        with self._lock:
+            if time.time() - self._last_batch_at >= self.batch_interval:
+                self._inference_batch()
 
     def _ticker(self):
         while not self._stop.wait(self.batch_interval):
@@ -1131,13 +1147,22 @@ class RealTimeIDSPipeline:
         threading.Thread(target=self._ticker, daemon=True, name="ids-flush-ticker").start()
         threading.Thread(target=self._capture_heartbeat, daemon=True, name="ids-capture-heartbeat").start()
         try:
-            sniff(
-                iface=interface if interface and interface != 'auto' else None,
-                prn=self.packet_callback,
-                store=False,
-                count=packet_count,
-                filter=bpf,
-            )
+            while not self._stop.is_set():
+                sniff(
+                    iface=interface if interface and interface != 'auto' else None,
+                    prn=self.packet_callback,
+                    store=False,
+                    count=packet_count,
+                    filter=bpf,
+                    timeout=10 if packet_count == 0 else None,
+                )
+                if packet_count > 0 or self._stop.is_set():
+                    break
+                logger.warning(
+                    "Scapy capture session returned; reopening interface '%s'.",
+                    interface,
+                )
+                self._stop.wait(0.5)
         except Exception as e:
             logger.error(f"Packet capture error: {e}")
             raise
