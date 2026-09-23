@@ -85,7 +85,8 @@ Network Traffic
 # Backend
 cd backend
 pip install -r requirements.txt
-
+```
+```bash
 # Frontend
 cd frontend
 npm install
@@ -117,7 +118,8 @@ python src/model_evaluation.py data/preprocessed/CICIDS2017_cleaned.csv
 # Start the backend
 cd backend
 python main.py
-
+```
+```bash
 # Start the frontend (separate terminal)
 cd frontend
 npm start
