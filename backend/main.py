@@ -80,38 +80,21 @@ socketio = SocketIO(app, cors_allowed_origins=allowed_origins(), async_mode='eve
 # the 'ids:alerts' stream, written by RealTimeIDSPipeline once packet
 # capture is running, and read here by both the REST API and the live
 # Socket.IO bridge below. There is no synthetic data path.
-def _connect_redis(max_attempts=5, base_delay=1.5):
-    """Connect to Redis with retry+backoff.
+def _connect_redis():
+    """Create a lazy Redis client that can connect or reconnect on use.
 
-    A single failed attempt previously disabled Redis for the entire
-    container lifetime -- but Docker's internal DNS for service names
-    (e.g. 'redis') can transiently fail to resolve right at container
-    startup, especially right after a restart, before fully settling.
-    That's a timing race, not a real outage, so it's worth a few
-    short retries before giving up.
+    redis-py opens connections when commands are issued, rather than when
+    the client is constructed. Keeping the client even if Redis is briefly
+    unavailable at dashboard startup lets later requests recover without
+    restarting the backend. REDIS_HOST/PORT/PASSWORD still must point at
+    the Redis instance used by this deployment.
     """
+    client = make_redis()
     host = f"{os.environ.get('REDIS_HOST', 'localhost')}:{os.environ.get('REDIS_PORT', '6379')}"
-    log = logging.getLogger("IDS-Orchestrator")
-    for attempt in range(1, max_attempts + 1):
-        try:
-            client = make_redis()          # shared with ids_pipeline.py: host/port/password
-            client.ping()
-            if attempt > 1:
-                log.info(f"Redis connected on attempt {attempt}/{max_attempts}.")
-            return client
-        except Exception as e:
-            if attempt < max_attempts:
-                delay = base_delay * attempt
-                log.warning(f"Redis connection attempt {attempt}/{max_attempts} failed "
-                            f"({host}): {e} -- retrying in {delay:.1f}s.")
-                time.sleep(delay)
-            else:
-                log.warning(f"Redis connection failed after {max_attempts} attempts "
-                            f"({host}): {e}. Continuing without Redis -- "
-                            f"history/settings/live-alerts will be unavailable "
-                            f"until the process is restarted.")
-                return None
-
+    logging.getLogger("IDS-Orchestrator").info(
+        "Redis client configured for %s; connection will be checked on use.", host
+    )
+    return client
 redis_client = _connect_redis()
 
 # Activate API routes (Redis-aware so History/Threat-Intel read real data)
