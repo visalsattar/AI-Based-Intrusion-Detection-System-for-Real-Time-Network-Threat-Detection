@@ -4,7 +4,8 @@
 # numpy-2 TensorFlow causes an ABI DLL-load failure (verified during setup).
 # scikit-learn>=1.5 is also required to unpickle the trained random_forest.pkl.
 numpy>=2.0,<2.3
-pandas>=2.2
+pandas>=2.2,<3.1  # tested against 2.2.x and 3.0.x; capped so a future major release
+                  # can't silently change preprocessing behavior without re-testing
 scikit-learn>=1.5,<1.6
 tensorflow>=2.18
 scapy>=2.4.5
