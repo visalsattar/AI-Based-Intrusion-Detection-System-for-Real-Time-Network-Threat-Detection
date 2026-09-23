@@ -1,3 +1,15 @@
+# Web dashboard + Redis by default. Live packet capture is a separate, opt-in service.
+#
+#   docker compose up --build                       # dashboard + Redis (needs REDIS_PASSWORD in .env)
+#   docker compose --profile capture up --build     # + sniffer  (LINUX HOST ONLY, see below)
+#
+# Why the sniffer is separate: a container on the default bridge network only sees its own
+# namespace (dashboard <-> Redis traffic), never your LAN. Capturing real traffic needs the
+# host's network namespace. `network_mode: host` gives that on Linux; on Docker Desktop
+# (Windows/macOS) "host" is the Linux VM, not your NIC -- run the sniffer natively instead:
+#
+#   set REDIS_HOST=127.0.0.1 & set REDIS_PORT=6380 & set REDIS_PASSWORD=<same as .env>
+#   python backend/main.py --mode ids --interface "<adapter name>"        (Npcap installed)
 services:
   redis:
     image: redis:alpine
@@ -28,10 +40,46 @@ services:
     environment:
       - REDIS_HOST=redis
       - REDIS_PASSWORD=${REDIS_PASSWORD}
-      - AUTO_CAPTURE=true
+      - IDS_API_TOKEN=${IDS_API_TOKEN:-}
+      - AUTO_CAPTURE=false
+    volumes:
+      # models are not in git (see .gitignore); mount them instead of baking them into the image
+      - ./backend/models:/app/models:ro
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  sniffer:
+    profiles: ["capture"]
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["python", "main.py", "--mode", "ids", "--interface", "${CAPTURE_INTERFACE:-auto}"]
+    user: root                    # raw sockets need it; keep this service tiny and separate
+    network_mode: host            # Linux only: sees the host's real interfaces
+    environment:
+      - REDIS_HOST=127.0.0.1
+      - REDIS_PORT=6380           # host-side port of the redis service above
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - IDS_WHITELIST=${IDS_WHITELIST:-}
+    volumes:
+      - ./backend/models:/app/models:ro
+      - ./backend/evidence:/app/evidence
+    tmpfs:
+      - /app/logs                 # root without CAP_DAC_OVERRIDE can't write ids-owned dirs
+    cap_drop:
+      - ALL
     cap_add:
-      - NET_ADMIN
       - NET_RAW
+      # - NET_ADMIN               # ONLY if you turn on Automatic IP Blocking: with host
+      #                           # networking the DROP rules land in the HOST firewall.
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
     depends_on:
       redis:
