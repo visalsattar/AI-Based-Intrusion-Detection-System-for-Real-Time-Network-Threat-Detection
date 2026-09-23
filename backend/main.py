@@ -24,14 +24,27 @@ This module acts as the central control plane for the IDS. It handles:
 # Disabling greendns falls back to the normal OS resolver, which talks
 # to Docker's embedded DNS correctly.
 import os
+import sys
 os.environ['EVENTLET_NO_GREENDNS'] = 'yes'
 
-import eventlet
-eventlet.monkey_patch()
+
+def _requested_mode() -> str:
+    for i, arg in enumerate(sys.argv):
+        if arg == '--mode' and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+        if arg.startswith('--mode='):
+            return arg.split('=', 1)[1]
+    return 'dashboard'
+
+
+_CLI_MODE = _requested_mode()
+
+if _CLI_MODE == 'dashboard':
+    import eventlet
+    eventlet.monkey_patch()
 
 # 2. Standard Library Imports
 import os
-import sys
 import time
 import argparse
 import logging
@@ -74,7 +87,11 @@ app = Flask(__name__, static_folder=FRONTEND_DIR, static_url_path=None)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY') or secrets.token_hex(32)
 # Same allow-list the REST guard uses (IDS_ALLOWED_ORIGINS); "*" let any web page a user
 # happened to visit open a socket to the dashboard and read live alerts.
-socketio = SocketIO(app, cors_allowed_origins=allowed_origins(), async_mode='eventlet')
+socketio = SocketIO(
+    app,
+    cors_allowed_origins=allowed_origins(),
+    async_mode='eventlet' if _CLI_MODE == 'dashboard' else 'threading',
+)
 
 # Optional Redis connection. All alert data — real or none — flows through
 # the 'ids:alerts' stream, written by RealTimeIDSPipeline once packet
@@ -313,4 +330,5 @@ def main():
         run_production_dashboard()
 
 if __name__ == '__main__':
-    main()    
+    main()
+    
