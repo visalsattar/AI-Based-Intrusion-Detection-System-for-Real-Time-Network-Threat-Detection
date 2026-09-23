@@ -22,6 +22,7 @@ backend/**/__pycache__/
 .pytest_cache/
 backend/.pytest_cache/
 backend/logs/
+backend/config/whitelist.json
 *.log
 backend/tests/
 backend/data/
