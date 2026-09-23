@@ -21,6 +21,7 @@ import pytest
 from scapy.all import IP, TCP
 
 import ids_pipeline
+from feature_order import FEATURE_ORDER
 from ids_pipeline import RealTimeIDSPipeline
 
 BACKEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -42,7 +43,7 @@ class FakeRedis:
     def get(self, key):
         return None
 
-    def xadd(self, stream, mapping):
+    def xadd(self, stream, mapping, **kw):   # the pipeline passes maxlen=/approximate=
         self.added.append((stream, mapping))
 
     def alerts(self):
@@ -108,6 +109,17 @@ def test_feature_vector_is_78_and_scaler_aligned(pipeline):
     assert features.shape == (78,), f"expected 78 features, got {features.shape}"
     assert features.shape[0] == pipeline.feature_scaler.n_features_in_
     assert np.isfinite(features).all(), "feature vector contains NaN/Inf"
+
+
+def test_scaler_feature_names_match_extractor_order(pipeline):
+    """
+    The fitted scaler's column order must equal the order _extract_flow_features emits.
+    A shape check cannot catch a column shift (shape stays (78,)); this can. If it fails, either
+    tests/feature_order.py has a typo against the real CICIDS header, or the extractor drifted.
+    """
+    names = [str(n) for n in pipeline.feature_scaler.feature_names_in_]
+    diffs = [(i, a, b) for i, (a, b) in enumerate(zip(names, FEATURE_ORDER)) if a != b]
+    assert names == FEATURE_ORDER, f"{len(diffs)} mismatches, first: {diffs[:5]}"
 
 
 def test_idle_flows_are_evicted(pipeline):
@@ -269,6 +281,7 @@ def test_done_flow_is_scored_once_and_removed(pipeline):
     pipeline.redis_client = FakeRedis()
     key = _make_flow(pipeline)
     pipeline.flow_tracker[key]['done'] = True
+    pipeline._done.add(key)   # what _ingest() does when it sees FIN/RST
     pipeline.packet_buffer.append((key, None))
     pipeline._inference_batch()
     assert key not in pipeline.flow_tracker
