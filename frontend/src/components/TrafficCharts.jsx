@@ -1,7 +1,7 @@
 // frontend/src/components/TrafficCharts.jsx
 /**
  * @file TrafficCharts.jsx
- * @description Attack Distribution donut + Threat Activity area chart.
+ * @description Severity Distribution donut + Threat Activity area chart.
  * Both are derived entirely from the real `alerts` array (sourced from the
  * Redis 'ids:alerts' stream via Socket.IO / REST) — there is no synthetic
  * fallback data. With zero alerts, both show an honest empty state instead
@@ -14,21 +14,17 @@ import {
   PieChart, Pie, Cell, Legend
 } from 'recharts';
 
-const CATEGORY_COLORS = {
-  Normal: '#38BDF8',
-  DoS: '#EF4444',
-  PortScan: '#F59E0B',
-  BruteForce: '#A855F7',
-  Other: '#64748B',
+const SEVERITY_COLORS = {
+  LOW: '#4ADE80',
+  MEDIUM: '#38BDF8',
+  HIGH: '#F59E0B',
+  CRITICAL: '#EF4444',
+  UNKNOWN: '#64748B',
 };
 
-const categorize = (threatType = '') => {
-  const t = threatType.toLowerCase();
-  if (t.includes('benign') || t.includes('normal')) return 'Normal';
-  if (t.includes('dos') || t.includes('ddos')) return 'DoS';
-  if (t.includes('port scan') || t.includes('portscan') || t.includes('scan')) return 'PortScan';
-  if (t.includes('brute')) return 'BruteForce';
-  return 'Other';
+const normalizeSeverity = (severity = '') => {
+  const value = String(severity).trim().toUpperCase();
+  return SEVERITY_COLORS[value] ? value : 'UNKNOWN';
 };
 
 const EmptyChartState = ({ label }) => (
@@ -40,21 +36,21 @@ const EmptyChartState = ({ label }) => (
   </div>
 );
 
-// ---------------- Attack Distribution Donut ----------------
+// ---------------- Severity Distribution Donut ----------------
 
 export const AttackDonut = ({ alerts = [] }) => {
   const data = useMemo(() => {
     const counts = {};
     alerts.forEach(a => {
-      const cat = categorize(a.threat_type);
-      counts[cat] = (counts[cat] || 0) + 1;
+      const severity = normalizeSeverity(a.severity);
+      counts[severity] = (counts[severity] || 0) + 1;
     });
     return Object.entries(counts).map(([name, value]) => ({ name, value }));
   }, [alerts]);
 
   return (
     <div className="chart-container">
-      <h3>Attack Distribution</h3>
+      <h3>Severity Distribution</h3>
       {data.length === 0 ? (
         <EmptyChartState label={"No alerts yet —\nstart packet capture to populate this chart."} />
       ) : (
@@ -72,7 +68,7 @@ export const AttackDonut = ({ alerts = [] }) => {
               isAnimationActive={false}
             >
               {data.map((entry) => (
-                <Cell key={entry.name} fill={CATEGORY_COLORS[entry.name] || CATEGORY_COLORS.Other} />
+                <Cell key={entry.name} fill={SEVERITY_COLORS[entry.name] || SEVERITY_COLORS.UNKNOWN} />
               ))}
             </Pie>
             <Tooltip contentStyle={{ backgroundColor: '#161B22', border: '1px solid #2A3340', borderRadius: 6, color: '#E8EAED' }} />
