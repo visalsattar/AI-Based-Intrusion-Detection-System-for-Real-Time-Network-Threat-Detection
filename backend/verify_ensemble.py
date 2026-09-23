@@ -1,187 +1,235 @@
 """
-End-to-end ensemble verification (no packet-capture privileges needed).
+Plumbing check for the live pipeline (no packet-capture privileges needed).
 
-Drives the REAL RealTimeIDSPipeline production code path:
-    packet_callback  ->  flow tracking
-    _inference_batch ->  feature extraction -> scaler -> autoencoder + RF
-                         -> score fusion -> alert -> Redis 'ids:alerts' stream
+WHAT THIS PROVES
+    synthetic packets -> packet_callback -> flow tracking -> FIN/RST completion -> feature
+    extraction -> scaler -> autoencoder (+ RF) -> score fusion -> alert -> Redis 'ids:alerts',
+    with every finished flow scored exactly once and the alert cooldown holding.
 
-Then reads the alerts back out of Redis exactly like the dashboard bridge
-does, proving the whole chain works with the real trained models.
+WHAT THIS DOES NOT PROVE
+    Detection quality. The synthetic flows' timing features are not representative (Flow Duration
+    is wall-clock, IATs come from the packets' fake timestamps), and step [4] feeds a row the
+    Random Forest was TRAINED on, under an invented IP. Model outputs are printed, never asserted.
+    For real detection numbers, capture your own traffic with IDS_DUMP_FEATURES and run
+    tools/skew_report.py.
 
-Run from the backend/ directory:  python verify_ensemble.py
+Exit code: 0 = plumbing OK, 1 = plumbing broken, 2 = model artifacts missing.
+Run from backend/:  python verify_ensemble.py
 """
+import json
 import os
 import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
-from scapy.all import IP, TCP  # type: ignore[reportMissingImports]  # noqa: E402
-from redis import Redis  # type: ignore[reportMissingImports]  # noqa: E402
-from ids_pipeline import RealTimeIDSPipeline  # type: ignore[reportMissingImports]  # noqa: E402
+from scapy.all import IP, TCP  # noqa: E402
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE, "models", "autoencoder.h5")
 SCALER_PATH = os.path.join(BASE, "models", "feature_scaler.pkl")
+STREAM = "ids:alerts"
 
 
-def feed(pipeline, packets):
-    """Replay packets through the real Scapy callback, then run one batch."""
-    for p in packets:
-        pipeline.packet_callback(p)
-    pipeline._inference_batch()
-
+# --------------------------------------------------------------------------- scenarios
+# Scoring happens when a flow FINISHES (FIN / RST / packet cap / idle), so every scenario ends
+# its flows the way real traffic does. Without that nothing would be scored at all.
 
 def benign_flow(t0):
-    """A normal short client/server HTTP exchange: SYN, SYN-ACK, data, ACK."""
-    c, s = "10.0.0.20", "93.184.216.34"  # client -> a normal web server
+    """Normal short HTTPS exchange, closed with FIN."""
+    c, s = "10.0.0.20", "93.184.216.34"
     pkts = [
         IP(src=c, dst=s) / TCP(sport=51000, dport=443, flags="S"),
         IP(src=s, dst=c) / TCP(sport=443, dport=51000, flags="SA"),
         IP(src=c, dst=s) / TCP(sport=51000, dport=443, flags="A") / ("x" * 200),
         IP(src=s, dst=c) / TCP(sport=443, dport=51000, flags="PA") / ("y" * 500),
-        IP(src=c, dst=s) / TCP(sport=51000, dport=443, flags="A"),
+        IP(src=c, dst=s) / TCP(sport=51000, dport=443, flags="FA"),
     ]
     for i, p in enumerate(pkts):
-        p.time = t0 + i * 0.05  # ~50 ms apart: relaxed, human-paced
+        p.time = t0 + i * 0.05
     return pkts
 
 
 def portscan_flow(t0):
-    """
-    A burst of tiny SYNs from one host to many ports. Each (src_port ->
-    dst_port) pair is a *separate* 1-packet flow — which is genuinely what a
-    port scan looks like on the wire. Included to show the pipeline handles
-    it without false-alarming on single stray SYNs.
-    """
+    """250 SYN probes from one host to one port each; the closed port answers RST-ACK, which is
+    what ends each 2-packet flow. Should produce at most one alert per severity (cooldown)."""
     attacker, victim = "45.13.227.7", "10.0.0.50"
     pkts = []
     for i in range(250):
-        p = IP(src=attacker, dst=victim) / TCP(sport=40000 + i, dport=80, flags="S")
-        p.time = t0 + i * 0.00002  # ~50k packets/sec: machine-gun fast
-        pkts.append(p)
+        sport = 40000 + i
+        a = IP(src=attacker, dst=victim) / TCP(sport=sport, dport=80, flags="S")
+        b = IP(src=victim, dst=attacker) / TCP(sport=80, dport=sport, flags="RA")
+        a.time, b.time = t0 + i * 0.0002, t0 + i * 0.0002 + 0.00005
+        pkts += [a, b]
     return pkts
 
 
 def synflood_flow(t0):
-    """
-    A sustained SYN flood: ONE flow (fixed 4-tuple) carrying hundreds of
-    rapid SYNs — high packet count, huge packets/sec, all-SYN, no data. This
-    is the high-rate shape the Random Forest was trained on (CICIDS DDoS).
-    """
+    """One fixed 4-tuple carrying 400 rapid SYNs, then an RST."""
     attacker, victim = "185.220.101.9", "10.0.0.50"
     pkts = []
     for i in range(400):
         p = IP(src=attacker, dst=victim) / TCP(sport=55555, dport=80, flags="S")
-        p.time = t0 + i * 0.00001  # ~100k packets/sec
+        p.time = t0 + i * 0.00001
         pkts.append(p)
+    r = IP(src=victim, dst=attacker) / TCP(sport=80, dport=55555, flags="RA")
+    r.time = t0 + 400 * 0.00001
+    pkts.append(r)
     return pkts
+
+
+SCENARIOS = [  # (title, builder, flows the pipeline must score)
+    ("benign HTTPS flow", benign_flow, 1),
+    ("port scan (250 probes, each answered by RST)", portscan_flow, 250),
+    ("SYN flood (one 401-packet flow)", synflood_flow, 1),
+]
+
+
+# --------------------------------------------------------------------------- helpers
+
+class CountingAE:
+    """Transparent wrapper: counts rows sent to predict() so 'scored exactly once' is checkable."""
+    def __init__(self, inner):
+        self._inner, self.rows = inner, 0
+
+    def predict(self, x, *a, **k):
+        self.rows += len(x)
+        return self._inner.predict(x, *a, **k)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+class Tee:
+    """Forwards xadd to the real stream (if any) and keeps a local copy of every alert."""
+    def __init__(self, real=None):
+        self.real, self.captured = real, []
+
+    def get(self, key):
+        return None          # never let stored UI settings (e.g. autoBlock) influence this check
+
+    def xadd(self, stream, mapping, **kw):
+        self.captured.append(mapping["data"])
+        if self.real is not None:
+            self.real.xadd(stream, mapping, **kw)
+
+
+def _fmt(a):
+    return (f"    src={a['src_ip']:<15} {a['severity']:<8} threat={a.get('threat_type', '?'):<15} "
+            f"score={a['anomaly_score']:.3f} (ae={a.get('ae_anomaly_score', float('nan')):.3f}, "
+            f"rf={a.get('rf_attack_prob')}) via {a.get('detection_source')} "
+            f"suppressed_since_last={a.get('suppressed_since_last', 0)}")
+
+
+def run_scenarios(pipeline, tee, say=print):
+    """Feeds every scenario through the real packet path. Returns (ok, per-scenario results)."""
+    ae = pipeline.autoencoder = CountingAE(pipeline.autoencoder)
+    # Pin behaviour: no Redis-stored settings, and the IPS can never touch the firewall here.
+    pipeline._settings_cache, pipeline._settings_loaded_at = {"autoBlock": False}, time.time() + 10**9
+    pipeline.redis_client = tee
+    ok, results, t0 = True, [], 1_700_000_000.0
+
+    for n, (title, build, expected) in enumerate(SCENARIOS, 1):
+        pipeline._last_alert.clear()
+        rows_before, alerts_before = ae.rows, len(tee.captured)
+        for p in build(t0 + n * 100):
+            pipeline.packet_callback(p)
+        pipeline.flush()
+        scored = ae.rows - rows_before
+        alerts = [json.loads(x) for x in tee.captured[alerts_before:]]
+        good = scored == expected and (len(alerts) <= 3)
+        ok &= good
+        say(f"[{n}] {title}\n    flows scored: {scored} (expected {expected})  alerts: {len(alerts)}  "
+            f"-> {'plumbing OK' if good else 'PLUMBING PROBLEM'}")
+        for a in alerts:
+            say(_fmt(a))
+        results.append({"title": title, "scored": scored, "expected": expected, "alerts": alerts})
+
+    leftover = len(pipeline.flow_tracker)
+    if leftover:
+        ok = False
+        say(f"    PLUMBING PROBLEM: {leftover} finished flows were never scored/removed")
+    return ok, results
+
+
+def training_row_smoke_test(pipeline, say=print):
+    """
+    [4] NAMING/PLUMBING CHECK ONLY. The first attack row of the training CSV is inside the split
+    the RF trained on, so P(attack)=1.0 here says nothing about generalisation.
+    """
+    csv_path = os.path.join(BASE, "data", "preprocessed", "CICIDS2017_cleaned.csv")
+    if pipeline.random_forest is None or not os.path.exists(csv_path):
+        say("[4] skipped (needs the RF and data/preprocessed/CICIDS2017_cleaned.csv)")
+        return
+    import numpy as np
+    import pandas as pd
+    from datetime import datetime
+
+    row = pd.read_csv(csv_path)
+    row = row[row["Label"] == 1].iloc[0].drop("Label").values.astype(np.float32).reshape(1, -1)
+    # The CSV is already MinMax-scaled: do NOT run feature_scaler.transform on it.
+    cls = int(pipeline.random_forest.predict(row)[0])
+    prob = float(pipeline.random_forest.predict_proba(row)[0, pipeline._rf_attack_idx])
+    name = pipeline._label_map.get(cls, f"Class {cls}")
+    err = float(np.mean(np.square(row - pipeline.autoencoder.predict(row, verbose=0))))
+    say(f"[4] training-row smoke test: RF class={cls} -> '{name}' (P={prob:.4f}), AE error={err:.6f}"
+        "\n    (a TRAINING row under an invented IP -- proves naming plumbing, not detection)")
+    fk, now = (("198.51.100.7", 12345), ("10.0.0.1", 80), 6), datetime.now()
+    pipeline._last_alert.clear()
+    pipeline.flow_tracker[fk] = {
+        "packets": 10, "bytes": 400, "first_seen": now, "last_seen": now, "protocol": 6,
+        "packet_list": [], "init_src": "198.51.100.7", "init_sport": 12345,
+        "init_dst": "10.0.0.1", "init_dport": 80, "fwd_win": 0, "bwd_win": 0, "done": False,
+        "init_syn": False,          # unproven direction: the IPS refuses to act on it
+    }
+    pipeline._process_prediction(fk, err, prob, name)
+    pipeline.flow_tracker.pop(fk, None)
 
 
 def main():
     if not (os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH)):
-        print("Model artifacts missing — train first. Aborting.")
-        return 1
+        print("Model artifacts missing (backend/models/autoencoder.h5, feature_scaler.pkl). "
+              "Download them from the release or train first.")
+        return 2
 
-    # alert_threshold matches run_ids_capture()'s production value.
+    from ids_pipeline import RealTimeIDSPipeline
+    from redis_util import make_redis
+
     pipeline = RealTimeIDSPipeline(
-        model_path=MODEL_PATH,
-        feature_extractor_path=SCALER_PATH,
-        alert_threshold=0.85,
-        packet_batch_size=100000,  # we trigger the batch manually
+        model_path=MODEL_PATH, feature_extractor_path=SCALER_PATH,
+        alert_threshold=0.85,             # same as run_ids_capture()
+        packet_batch_size=10**9, batch_interval=10**9,   # we flush manually
     )
-
-    ensemble_on = pipeline.random_forest is not None
-    print("\n" + "=" * 68)
-    print(f"Ensemble mode: {'autoencoder + random forest' if ensemble_on else 'AUTOENCODER ONLY (RF failed to load)'}")
-    print(f"Calibrated threshold in use: {pipeline.recon_threshold:.7f} "
-          f"(calibrated={pipeline._threshold_calibrated})")
-    print("=" * 68)
-
-    # Mark where we are in the Redis stream so we only read NEW alerts.
-    redis = Redis(host=os.environ.get("REDIS_HOST", "localhost"), port=6379, decode_responses=True)
+    real = None
     try:
-        last_id = redis.xrevrange("ids:alerts", count=1)
-        start_id = last_id[0][0] if last_id else "0"
+        real = make_redis()
+        real.ping()
     except Exception as e:
-        print(f"Redis unavailable ({e}); alerts won't be read back, but scoring still runs.")
-        start_id = None
-    # Point the pipeline at the same local Redis for this check.
-    pipeline.redis_client = redis if start_id is not None else None
+        print(f"Redis unavailable ({e}); using an in-memory capture instead (no read-back check).")
+        real = None
 
-    t0 = 1_700_000_000.0  # fixed base time (deterministic IATs)
-    print("\n[1] Feeding a BENIGN web flow ...")
-    feed(pipeline, benign_flow(t0))
-    print("[2] Feeding a PORT-SCAN burst (250 single-SYN flows) ...")
-    feed(pipeline, portscan_flow(t0 + 10))
-    print("[3] Feeding a SYN-FLOOD (one high-rate 400-packet flow) ...")
-    feed(pipeline, synflood_flow(t0 + 20))
+    print("=" * 72)
+    print(f"Ensemble: {'autoencoder + random forest' if pipeline.random_forest is not None else 'AUTOENCODER ONLY (RF not loaded)'}"
+          f" | recon threshold {pipeline.recon_threshold:.7f} (calibrated={pipeline._threshold_calibrated})")
+    print("=" * 72)
 
-    # [4] Direct RF class-naming proof: inject a flow whose features come
-    # from an actual DDoS row in the preprocessed CSV. The RF was trained
-    # on this exact data, so it correctly predicts class 1 → "DDoS".
-    # (Synthetic Scapy packets don't match CICIDS feature patterns closely
-    #  enough for the RF to recognise them as DDoS — this is the right test.)
-    print("[4] Injecting a REAL DDoS feature vector from the preprocessed CSV ...")
-    csv_path = os.path.join(BASE, "data", "preprocessed", "CICIDS2017_cleaned.csv")
-    if os.path.exists(csv_path):
-        import numpy as np  # type: ignore[reportMissingImports]
-        import pandas as pd  # type: ignore[reportMissingImports]
-        from datetime import datetime as dt
-        df = pd.read_csv(csv_path)
-        ddos_row = df[df["Label"] == 1].iloc[0].drop("Label").values.astype(np.float32)
-        # Inject as a fake flow entry so _process_prediction can read it.
-        fk = (("45.0.0.1", 12345), ("10.0.0.1", 80), 6)
-        now = dt.now()
-        pipeline.flow_tracker[fk] = {
-            "packets": 10, "bytes": 400, "first_seen": now, "last_seen": now,
-            "protocol": 6, "packet_list": [],
-            "init_src": "45.0.0.1", "init_sport": 12345,
-            "init_dst": "10.0.0.1", "init_dport": 80,
-            "fwd_win": 0, "bwd_win": 0,
-        }
-        # The cleaned CSV is already MinMax-scaled; do NOT apply
-        # feature_scaler.transform() here (the scaler was fitted on raw
-        # Scapy-extracted values, so applying it to [0,1] data would
-        # double-scale and push all values near 0, causing the RF to
-        # misclassify everything as Benign).
-        scaled = ddos_row.reshape(1, -1)
-        # Get RF class name directly.
-        pred_class = int(pipeline.random_forest.predict(scaled)[0])
-        rf_prob    = float(pipeline.random_forest.predict_proba(scaled)[0, pipeline._rf_attack_idx])
-        threat_name = pipeline._label_map.get(pred_class, f"Class {pred_class}")
-        print(f"    RF predicted class={pred_class} -> threat_name='{threat_name}' (P={rf_prob:.4f})")
-        # Compute AE recon error on this real feature vector.
-        reconstructed = pipeline.autoencoder.predict(scaled, verbose=0)
-        recon_error = float(np.mean(np.square(scaled - reconstructed)))
-        pipeline._process_prediction(fk, recon_error, rf_prob, threat_name)
-    else:
-        print("    (preprocessed CSV not found — skipping direct RF naming test)")
+    tee = Tee(real)
+    ok, _ = run_scenarios(pipeline, tee)
+    training_row_smoke_test(pipeline)
 
-    time.sleep(0.2)
-    if start_id is None:
-        return 0
+    if real is not None and tee.captured:
+        try:
+            stored = {f["data"] for _, f in real.xrevrange(STREAM, count=len(tee.captured) + 50)}
+            missing = [d for d in tee.captured if d not in stored]
+            print(f"\nRedis read-back: {len(tee.captured) - len(missing)}/{len(tee.captured)} alerts found in '{STREAM}'")
+            ok &= not missing
+        except Exception as e:
+            print(f"\nRedis read-back failed: {e}")
+            ok = False
 
-    alerts = redis.xrange("ids:alerts", min="(" + start_id, max="+")
-    print("\n" + "=" * 68)
-    print(f"ALERTS RAISED (read back from Redis 'ids:alerts'): {len(alerts)}")
-    print("=" * 68)
-    import json
-    for _id, fields in alerts:
-        a = json.loads(fields["data"])
-        print(
-            f"  src={a['src_ip']:<15} severity={a['severity']:<8} "
-            f"threat={a.get('threat_type','?'):<12} "
-            f"score={a['anomaly_score']:.3f} "
-            f"(ae={a.get('ae_anomaly_score', float('nan')):.3f}, "
-            f"rf={a.get('rf_attack_prob')}) "
-            f"pkts={a['packet_count']} via {a.get('detection_source')}"
-        )
-    if not alerts:
-        print("  (none — both flows scored below the alert threshold)")
-    print()
-    return 0
+    print("\nPLUMBING CHECK:", "PASS" if ok else "FAIL")
+    return 0 if ok else 1
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
