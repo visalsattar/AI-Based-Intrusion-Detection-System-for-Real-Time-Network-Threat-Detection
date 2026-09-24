@@ -64,6 +64,12 @@ def make_pipeline():
     p._threshold_calibrated = True
     p.AE_OVERRIDE_CONF, p.RF_OVERRIDE_CONF = 0.97, 0.90
     p.packet_buffer, p.flow_tracker = [], {}
+    # object.__new__ bypasses RealTimeIDSPipeline.__init__, so initialise the
+    # capture state used by packet_callback() and the periodic sweep path.
+    p._capture_counter_lock = threading.Lock()
+    p._capture_packets = 0
+    p._capture_ipv4_transport_packets = 0
+    p._capture_health_at = time.monotonic()
     p._settings_cache, p._settings_loaded_at = {}, time.time() + 1e9   # never hit Redis
     p._last_alert = {}
     p._lock, p._done, p._last_sweep_at = threading.RLock(), set(), 0.0
@@ -72,5 +78,4 @@ def make_pipeline():
     p._dump_path, p._dump_rows, p._dump_max = None, 0, 200000
     p.autoencoder, p.feature_scaler = StubAE(), StubScaler()
     return p
-
 
