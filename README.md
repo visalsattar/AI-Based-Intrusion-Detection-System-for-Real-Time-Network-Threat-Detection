@@ -61,7 +61,7 @@ Network Traffic
 | Model | F1-Score | Role |
 | --- | --- | --- |
 | Random Forest | ~99.5% | Live fusion |
-| Autoencoder | ~52-54% | Live fusion |
+| Autoencoder | ~52-54%* | Live fusion |
 | CNN | ~99.5% | Offline only |
 
 *The Autoencoder's lower standalone score reflects the inherent difficulty of unsupervised anomaly detection on this dataset — it's reported here rather than omitted, and is why the fusion layer weights it alongside a supervised model instead of relying on it alone. The exact current artifact reports CNN F1=99.51%, RF F1=99.50%, and AE F1=53.78%. The CNN confusion matrix covers a 4,505-sequence evaluation subset, so these are experiment-specific offline results, not live-traffic guarantees.
@@ -131,9 +131,12 @@ Dashboard available at localhost:3000 for React development (Docker serves it at
 
 Start Redis and the dashboard with docker compose up --build. In another PowerShell window run ./start-capture.ps1; it requests Administrator access and connects host-side Scapy to Docker Redis. Npcap must be installed. Keep the capture window open. Only flows above the alert threshold appear in Threat Intel.
 
-**Demo: show live threats and thesis evidence**
+**Controlled live-lab capture and thesis evidence**
 
-Use this flow when presenting the system for viva or taking thesis screenshots.
+Use this only on an isolated network containing systems you own: an attacker VM,
+a victim VM/service, and the sensor. `verify_ensemble.py` remains a synthetic
+fusion/plumbing check; its evidence is marked as synthetic and must not be
+presented as a live capture.
 
 ```powershell
 # Terminal 1: start Docker Redis + dashboard
@@ -144,9 +147,11 @@ docker compose up
 Open the dashboard at `http://localhost:5000`.
 
 ```powershell
-# Terminal 2: Administrator PowerShell, keep this open
+# Terminal 2: Administrator PowerShell, keep this open.
+# -LiveLab marks evidence as controlled live-lab traffic; -FeatureDump records
+# the exact raw rows that must later be used for live-model training.
 cd D:\Github\AI-Based-Intrusion-Detection-System-for-Real-Time-Network-Threat-Detection
-.\start-capture.ps1
+.\start-capture.ps1 -LiveLab -FeatureDump .\backend\evidence\live_lab_features.csv
 ```
 
 Healthy capture logs include:
@@ -157,13 +162,20 @@ CAPTURE_HEALTH packets=... ipv4_tcp_udp=...
 DIAGNOSTIC recon_error=... anomaly_score=...
 ```
 
-Generate traffic while capture is running:
+Generate benign baseline traffic first, then only controlled scenarios against
+the isolated victim. Do not scan or flood public systems. Use the labelled
+feature dump and PCAP/event log to retrain into `models/live_flow_v1/`.
+
+Before enabling AE-only alerting, validate score variation:
 
 ```powershell
-1..20 | ForEach-Object {
-    Invoke-WebRequest https://example.com -TimeoutSec 10 | Out-Null
-}
+cd backend
+python validate_live_capture.py evidence\live_lab_features.csv --models models\live_flow_v1
 ```
+
+Only after that command passes, an operator may explicitly enable the
+AE-only path on a later capture with `-EnableValidatedAeOnly`. The default
+remains disabled.
 
 Confirm alerts and evidence:
 
@@ -172,7 +184,7 @@ docker compose exec redis redis-cli XLEN ids:alerts
 Get-ChildItem .\backend\evidence | Sort-Object LastWriteTime -Descending | Select-Object -First 10
 ```
 
-Evidence is saved in `backend\evidence\alerts.jsonl` and `backend\evidence\threat-*.png`. Refresh `http://localhost:5000` and capture screenshots of the dashboard, Latest Alerts, Alert History, Threat Intel, and the evidence folder.
+Evidence is saved in `backend\evidence\alerts.jsonl` and `backend\evidence\threat-*.png` with an explicit origin (`synthetic_fusion_verification`, `live_lab`, or `live_unclassified`). Do not set `IDS_AE_ONLY_ALERTING_VALIDATED=true` until the validator passes and you have calibrated a live-lab model threshold.
 
 You can also start the demo helper from `bat files\5-demo-threat-capture.bat`.
 
