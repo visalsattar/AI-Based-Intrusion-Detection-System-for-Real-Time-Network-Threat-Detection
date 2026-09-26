@@ -69,6 +69,7 @@ const Dashboard = () => {
   const [alerts, setAlerts] = useState([]);
   const [devices, setDevices] = useState([]);
   const [isConnected, setIsConnected] = useState(false);
+  const [soundEnabled, setSoundEnabled] = useState(true);
   const [scanning, setScanning] = useState(false);
   const [uptimeStart] = useState(Date.now());
   const [uptime, setUptime] = useState('0h 0m 0s');
@@ -79,6 +80,13 @@ const Dashboard = () => {
     axios.get('/api/history')
       .then(res => setAlerts(prev => mergeAlerts(prev, Array.isArray(res.data) ? res.data : [])))
       .catch(err => console.error('Failed to load alert history:', err));
+  }, []);
+
+  // Keep notification audio aligned with the saved Settings toggle.
+  useEffect(() => {
+    axios.get('/api/settings')
+      .then(res => setSoundEnabled(res.data?.sound !== false))
+      .catch(err => console.error('Failed to load alert preferences:', err));
   }, []);
 
   // --- Real system health poller (CPU/RAM/Disk via psutil) ---
@@ -134,9 +142,9 @@ const Dashboard = () => {
 
     const handleNewAlert = (alert) => {
       setAlerts(prev => mergeAlerts(prev, alert));
-      if (alert.severity === 'CRITICAL') {
+      if (soundEnabled && alert.severity === 'CRITICAL') {
         new Audio('/critical.mp3').play().catch(() => {});
-      } else if (alert.severity === 'HIGH') {
+      } else if (soundEnabled && alert.severity === 'HIGH') {
         new Audio('/high.mp3').play().catch(() => {});
       }
     };
@@ -151,7 +159,7 @@ const Dashboard = () => {
       socket.off('disconnect', handleDisconnect);
       socket.off('new_alert', handleNewAlert);
     };
-  }, []);
+  }, [soundEnabled]);
 
   const criticalCount = alerts.filter(a => a.severity === 'CRITICAL').length;
   const mappable = alerts.filter(a => a.location?.lat != null && a.location?.lon != null);
