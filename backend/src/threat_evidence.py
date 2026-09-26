@@ -22,6 +22,28 @@ _SEVERITY = {
     "LOW": "#4ade80",
 }
 
+# Evidence must say where it came from.  In particular, a constructed flow
+# passed through verify_ensemble.py is valuable test evidence, but it is not a
+# live observation and must never be presented as one.
+_EVIDENCE_ORIGINS = {
+    "synthetic_fusion_verification",
+    "live_lab",
+    "live_unclassified",
+}
+
+
+def evidence_origin():
+    """Return a safe, explicit provenance label for a saved evidence item."""
+    origin = os.environ.get("IDS_EVIDENCE_ORIGIN", "live_unclassified").strip().lower()
+    if origin not in _EVIDENCE_ORIGINS:
+        return "live_unclassified"
+    return origin
+
+
+def normalise_evidence_origin(origin):
+    origin = str(origin or "").strip().lower()
+    return origin if origin in _EVIDENCE_ORIGINS else "live_unclassified"
+
 
 def _font(size, bold=False):
     candidates = (
@@ -75,6 +97,7 @@ def _draw_card(alert, evidence_id, image_path):
         timestamp_text = "unknown time"
 
     fields = [
+        ("Evidence origin", alert.get("evidence_origin", "live_unclassified")),
         ("Timestamp", timestamp_text),
         ("Threat type", alert.get("threat_type", "Unknown")),
         ("Source IP", alert.get("src_ip", "Unknown")),
@@ -96,8 +119,11 @@ def _draw_card(alert, evidence_id, image_path):
 
     draw.line((68, 612, _WIDTH - 68, 612), fill="#303949", width=1)
     draw.text((72, 630), f"Evidence ID: {evidence_id}", fill=_ACCENT, font=small_font)
-    draw.text((72, 654),
-              "Alert metadata only. No packet payloads are included.",
+    provenance = str(alert.get("evidence_origin", "live_unclassified"))
+    note = ("SYNTHETIC TEST EVIDENCE — not live captured traffic."
+            if provenance == "synthetic_fusion_verification"
+            else "Alert metadata only. No packet payloads are included.")
+    draw.text((72, 654), note,
               fill=_MUTED, font=small_font)
     image.save(image_path, format="PNG", optimize=True)
 
@@ -115,7 +141,11 @@ def save_threat_evidence(alert):
     image_path = os.path.join(output_dir, image_name)
     record_path = os.path.join(output_dir, "alerts.jsonl")
 
-    fields = {"evidence_id": evidence_id, "evidence_image": image_name}
+    fields = {
+        "evidence_id": evidence_id,
+        "evidence_image": image_name,
+        "evidence_origin": normalise_evidence_origin(alert.get("evidence_origin") or evidence_origin()),
+    }
     record = dict(alert)
     record.update(fields)
     record["evidence_saved_at"] = now.isoformat()
