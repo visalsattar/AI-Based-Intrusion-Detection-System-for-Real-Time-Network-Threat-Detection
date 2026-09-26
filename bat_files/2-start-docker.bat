@@ -1,5 +1,5 @@
 @echo off
-REM start.bat -- double-click this to build and run the entire stack
+REM 2-start-docker.bat -- double-click this to build and run the entire stack
 REM (Redis + Backend + the built-in React frontend) with one click.
 REM No need to ever run "npm start" or "npm run build" manually --
 REM the frontend is compiled inside the Docker image automatically.
