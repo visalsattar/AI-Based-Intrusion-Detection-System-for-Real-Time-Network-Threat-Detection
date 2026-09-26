@@ -3,7 +3,6 @@ import hmac
 import json
 import logging
 import os
-import re
 from collections import defaultdict
 from urllib.parse import urlparse
 
@@ -26,9 +25,6 @@ DEFAULT_SETTINGS = {
     "desktopNotifications": True,
     "geolocationEnabled": True,
     "threatIntelEnabled": True,
-    # Prefer the ABUSEIPDB_API_KEY env var. A key pasted into the Settings page IS stored in
-    # Redis in plaintext (protected only by REDIS_PASSWORD) and is never echoed back to the client.
-    "abuseIPDBKey": "",
     "autoBlock": False,
     "criticalThreshold": 0.95,
     "highThreshold": 0.85,
@@ -77,12 +73,6 @@ def _enum(*allowed):
     return check
 
 
-def _api_key(v):
-    if not isinstance(v, str) or not re.fullmatch(r"[A-Za-z0-9]{16,128}", v):
-        raise ValueError("does not look like an AbuseIPDB key")
-    return v
-
-
 # Allow-list. Anything not in here is dropped instead of being written to Redis (the UI also
 # posts read-only fields such as abuseIPDBKeySet -- those are simply ignored, not rejected).
 SETTINGS_SCHEMA = {
@@ -94,7 +84,6 @@ SETTINGS_SCHEMA = {
     "geolocationEnabled": _flag,
     "threatIntelEnabled": _flag,
     "autoBlock": _flag,
-    "abuseIPDBKey": _api_key,
     "criticalThreshold": _num(0.80, 0.999, float),
     "highThreshold": _num(0.50, 0.95, float),
 }
@@ -139,7 +128,9 @@ def _load_settings(redis_client) -> dict:
         try:
             stored = redis_client.get('ids:settings')
             if stored:
-                settings.update(json.loads(stored))
+                saved = json.loads(stored)
+                saved.pop("abuseIPDBKey", None)  # discard legacy plaintext keys
+                settings.update(saved)
         except Exception as e:
             logger.warning(f"Could not read settings from Redis: {e}")
     return settings
@@ -154,6 +145,17 @@ def register_routes(app, redis_client=None):
     AbuseIPDB API, the real on-disk GeoIP/model status, and real OS-level
     network introspection. There is no mock/demo data path.
     """
+
+    # Migrate credentials written by older versions out of the Redis settings document.
+    if redis_client:
+        try:
+            stored = redis_client.get('ids:settings')
+            legacy = json.loads(stored) if stored else {}
+            if isinstance(legacy, dict) and legacy.pop('abuseIPDBKey', None):
+                redis_client.set('ids:settings', json.dumps(legacy))
+                logger.warning("Removed a legacy AbuseIPDB key from Redis settings; configure it in backend/.env.")
+        except Exception as e:
+            logger.warning(f"Could not clean legacy AbuseIPDB settings: {e}")
 
     # ---------------- Guard for state-changing requests ----------------
 
@@ -290,11 +292,8 @@ def register_routes(app, redis_client=None):
     def get_settings():
         settings = _load_settings(redis_client)
         # Never echo the raw API key back to the client beyond a masked preview
-        if settings.get('abuseIPDBKey') or os.environ.get('ABUSEIPDB_API_KEY'):
-            settings['abuseIPDBKeySet'] = True
-            settings['abuseIPDBKey'] = ''
-        else:
-            settings['abuseIPDBKeySet'] = False
+        settings['abuseIPDBKeySet'] = bool(os.environ.get('ABUSEIPDB_API_KEY'))
+        settings.pop('abuseIPDBKey', None)
         return jsonify(settings)
 
     @app.route('/api/save-settings', methods=['POST'])
