@@ -15,6 +15,8 @@ Python backend handling packet capture, AI inference, alert streaming, and the F
 Calibrated reconstruction threshold: `0.003154` (90th percentile of benign errors).
 Random Forest false positive rate: **0.25%** (84 / 33,790 benign flows).
 
+These are held-out offline results for the documented CICIDS2017 Friday-Afternoon DDoS evaluation. The CNN is not used for live packet scoring: it expects 100-flow row-ordered sequences. Its current confusion matrix covers 4,505 sequence samples, while the general metrics artifact records 45,149 rows for the broader evaluation context; do not present those as identical sample counts.
+
 ---
 
 ## Setup
@@ -62,15 +64,9 @@ Tests:
 python -m pytest tests/ -v
 ```
 
-## Automated Test Metrics
+## Automated Tests
 
-| File | Count | Covers |
-| :--- | :---: | :--- |
-| `test_preprocessing.pY` | 4 | Inf removal, MinMax range, label encoding, text column drop |
-| `test_model_training.py` | 5 | Window shape, ordering, last-row label, small-split error, leakage regression |
-| `test_inference.py` | 11 | Scoring, overrides, alert gating, threat name propagation |
-| `test_feature_alignment.py` | 1 | Confirms feature_scaler.pkl exists and carries feature names (inferred from test name — verify against actual file) |
-| `test_proposed_block_queue.py` | 1 | Confirms a proposed IP-block queue writes to Redis via xadd (inferred from test name — verify against actual file) |
+The suite covers preprocessing, live flow scoring, route security, threat-intel privacy, and sequence construction. Model-backed inference and scaler-alignment tests require artifacts under backend/models. CI downloads those artifacts and fails if any test is skipped.
 
 Structure
 
@@ -109,7 +105,7 @@ backend/
 
 ## Known Limitations
 
-* Live feature extraction covers ~24 of 78 CICIDS2017 features; remaining are zero-filled.
+* Live extraction emits 78 columns in scaler order, but only a subset has CICFlowMeter-equivalent measurements; unsupported values are zero-filled, so full feature parity and offline-equivalent live accuracy are not claimed.
 * RF classifies real CICIDS2017 vectors correctly but predicts Benign on Scapy-captured flows.
 * The AE override handles live detection for those cases.
 * CNN is offline-only — requires 100-flow ordered windows unavailable in per-flow live capture.
