@@ -5,7 +5,7 @@ REM This file lives in "bat files", so move to the project root first.
 cd /d "%~dp0.."
 
 echo ============================================
-echo  AI-IDS Threat Demo Helper
+echo  AI-IDS Capture Demo Helper
 echo ============================================
 echo.
 echo This window starts Docker Redis + Dashboard.
@@ -19,7 +19,7 @@ echo   .\start-capture.ps1
 echo.
 echo Keep both windows open during the demo.
 echo.
-echo To generate traffic later, run this in a third PowerShell window:
+echo To generate benign web traffic later, run this in a third PowerShell window:
 echo.
 echo   1..20 ^| ForEach-Object { Invoke-WebRequest https://example.com -TimeoutSec 10 ^| Out-Null }
 echo.
