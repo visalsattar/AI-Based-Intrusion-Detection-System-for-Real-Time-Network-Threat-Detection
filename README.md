@@ -61,7 +61,7 @@ Network Traffic
 | Model | F1-Score | Role |
 | --- | --- | --- |
 | Random Forest | ~99.5% | Live fusion |
-| Autoencoder | ~52-54%* | Live fusion |
+| Autoencoder | ~52-54% | Live fusion |
 | CNN | ~99.5% | Offline only |
 
 *The Autoencoder's lower standalone score reflects the inherent difficulty of unsupervised anomaly detection on this dataset — it's reported here rather than omitted, and is why the fusion layer weights it alongside a supervised model instead of relying on it alone. The exact current artifact reports CNN F1=99.51%, RF F1=99.50%, and AE F1=53.78%. The CNN confusion matrix covers a 4,505-sequence evaluation subset, so these are experiment-specific offline results, not live-traffic guarantees.
