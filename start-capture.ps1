@@ -1,5 +1,8 @@
 param(
-    [string]$Interface = 'auto'
+    [string]$Interface = 'auto',
+    [switch]$LiveLab,
+    [switch]$EnableValidatedAeOnly,
+    [string]$FeatureDump
 )
 
 $ErrorActionPreference = 'Stop'
@@ -9,7 +12,11 @@ $principal = [Security.Principal.WindowsPrincipal]::new($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     $pwsh = (Get-Process -Id $PID).Path
     $safeInterface = $Interface.Replace('"', '\"')
-    $arguments = '-NoExit -ExecutionPolicy Bypass -File "' + $PSCommandPath + '" -Interface "' + $safeInterface + '"'
+    $arguments = '-NoExit -ExecutionPolicy Bypass -File "' + $PSCommandPath + '" -Interface "' + $safeInterface + '" -LiveLab:$' + $LiveLab + ' -EnableValidatedAeOnly:$' + $EnableValidatedAeOnly
+    if ($FeatureDump) {
+        $safeDump = $FeatureDump.Replace('"', '\"')
+        $arguments += ' -FeatureDump "' + $safeDump + '"'
+    }
     Start-Process -FilePath $pwsh -Verb RunAs -ArgumentList $arguments
     exit
 }
@@ -45,8 +52,25 @@ $env:REDIS_HOST = '127.0.0.1'
 $env:REDIS_PORT = '6380'
 $env:REDIS_PASSWORD = $redisPassword
 $env:CAPTURE_INTERFACE = $Interface
+$env:IDS_EVIDENCE_ORIGIN = if ($LiveLab) { 'live_lab' } else { 'live_unclassified' }
+# Never enable AE-only alerting just because capture started. Enable it only
+# after validate_live_capture.py passes on a labelled controlled-lab capture.
+$env:IDS_AE_ONLY_ALERTING_VALIDATED = if ($EnableValidatedAeOnly) { 'true' } else { 'false' }
+if ($FeatureDump) {
+    $env:IDS_DUMP_FEATURES = if ([IO.Path]::IsPathRooted($FeatureDump)) {
+        $FeatureDump
+    } else {
+        Join-Path $root $FeatureDump
+    }
+}
 Set-Location (Join-Path $root 'backend')
 
 python -c "import os, redis; redis.Redis(host='127.0.0.1', port=6380, password=os.environ.get('REDIS_PASSWORD'), socket_connect_timeout=2, socket_timeout=2).ping(); print('Redis auth OK')"
-Write-Host "Starting IDS capture on interface '$Interface'. Leave this window open." -ForegroundColor Green
+Write-Host "Starting IDS capture on interface '$Interface' (evidence: $env:IDS_EVIDENCE_ORIGIN). Leave this window open." -ForegroundColor Green
+if ($FeatureDump) {
+    Write-Host "Raw live features will be appended to: $FeatureDump" -ForegroundColor Yellow
+}
+if ($EnableValidatedAeOnly) {
+    Write-Warning 'AE-only alerting enabled by explicit operator choice. Use this only after validate_live_capture.py passed on held-out controlled live-lab traffic.'
+}
 python main.py --mode ids --interface $env:CAPTURE_INTERFACE
