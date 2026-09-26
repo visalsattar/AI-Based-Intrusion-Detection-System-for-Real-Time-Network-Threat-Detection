@@ -78,4 +78,3 @@ def make_pipeline():
     p._dump_path, p._dump_rows, p._dump_max = None, 0, 200000
     p.autoencoder, p.feature_scaler = StubAE(), StubScaler()
     return p
-
