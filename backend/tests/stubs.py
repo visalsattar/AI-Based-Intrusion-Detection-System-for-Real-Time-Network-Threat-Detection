@@ -63,6 +63,8 @@ def make_pipeline():
     p.recon_threshold = 0.003154
     p._threshold_calibrated = True
     p.AE_OVERRIDE_CONF, p.RF_OVERRIDE_CONF = 0.97, 0.90
+    p.ae_only_alerting_validated = True
+    p.evidence_origin = "live_unclassified"
     p.packet_buffer, p.flow_tracker = [], {}
     # object.__new__ bypasses RealTimeIDSPipeline.__init__, so initialise the
     # capture state used by packet_callback() and the periodic sweep path.
