@@ -64,7 +64,7 @@ Network Traffic
 | Autoencoder | ~52-54%* | Live fusion |
 | CNN | ~99.5% | Offline only |
 
-*The Autoencoder's lower standalone score reflects the inherent difficulty of unsupervised anomaly detection on this dataset — it's reported here rather than omitted, and is why the fusion layer weights it alongside a supervised model instead of relying on it alone.
+*The Autoencoder's lower standalone score reflects the inherent difficulty of unsupervised anomaly detection on this dataset — it's reported here rather than omitted, and is why the fusion layer weights it alongside a supervised model instead of relying on it alone. The exact current artifact reports CNN F1=99.51%, RF F1=99.50%, and AE F1=53.78%. The CNN confusion matrix covers a 4,505-sequence evaluation subset, so these are experiment-specific offline results, not live-traffic guarantees.
 
 ---
 
@@ -131,6 +131,51 @@ Dashboard available at localhost:3000 for React development (Docker serves it at
 
 Start Redis and the dashboard with docker compose up --build. In another PowerShell window run ./start-capture.ps1; it requests Administrator access and connects host-side Scapy to Docker Redis. Npcap must be installed. Keep the capture window open. Only flows above the alert threshold appear in Threat Intel.
 
+**Demo: show live threats and thesis evidence**
+
+Use this flow when presenting the system for viva or taking thesis screenshots.
+
+```powershell
+# Terminal 1: start Docker Redis + dashboard
+cd D:\Github\AI-Based-Intrusion-Detection-System-for-Real-Time-Network-Threat-Detection
+docker compose up
+```
+
+Open the dashboard at `http://localhost:5000`.
+
+```powershell
+# Terminal 2: Administrator PowerShell, keep this open
+cd D:\Github\AI-Based-Intrusion-Detection-System-for-Real-Time-Network-Threat-Detection
+.\start-capture.ps1
+```
+
+Healthy capture logs include:
+
+```text
+CAPTURE_HEARTBEAT alive
+CAPTURE_HEALTH packets=... ipv4_tcp_udp=...
+DIAGNOSTIC recon_error=... anomaly_score=...
+```
+
+Generate traffic while capture is running:
+
+```powershell
+1..20 | ForEach-Object {
+    Invoke-WebRequest https://example.com -TimeoutSec 10 | Out-Null
+}
+```
+
+Confirm alerts and evidence:
+
+```powershell
+docker compose exec redis redis-cli XLEN ids:alerts
+Get-ChildItem .\backend\evidence | Sort-Object LastWriteTime -Descending | Select-Object -First 10
+```
+
+Evidence is saved in `backend\evidence\alerts.jsonl` and `backend\evidence\threat-*.png`. Refresh `http://localhost:5000` and capture screenshots of the dashboard, Latest Alerts, Alert History, Threat Intel, and the evidence folder.
+
+You can also start the demo helper from `bat files\5-demo-threat-capture.bat`.
+
 The AbuseIPDB credential previously committed to GitHub must be revoked and replaced. Put the replacement in backend/.env as ABUSEIPDB_API_KEY=... . The Settings page no longer submits or stores the key. Removing it from current files does not remove it from old Git commits.
 
 **Verify the full pipeline**
@@ -155,7 +200,7 @@ cd backend
 python -m pytest tests/ -v
 ```
 
-22 tests covering preprocessing, sequence construction (including a train/test leakage regression), and live inference fusion logic.
+The current suite contains 82 test functions, producing 91 collected pytest items after parameterization. The latest run passed all 91 items; coverage includes preprocessing, sequence construction (including a train/test leakage regression), live inference fusion logic, flow scoring, route security, threat-intelligence privacy, and whitelist behavior.
 
 **Docker**
 
