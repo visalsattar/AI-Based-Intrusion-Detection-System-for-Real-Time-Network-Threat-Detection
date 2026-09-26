@@ -145,6 +145,17 @@ class RealTimeIDSPipeline:
     AE_OVERRIDE_CONF = 0.97   # autoencoder alone -> possible novel/unknown attack
     RF_OVERRIDE_CONF = 0.90   # random forest alone -> high-confidence known attack
 
+    # These values are deliberately explicit rather than inferred from zero
+    # values: zero is a valid value for many network features.  The lightweight
+    # live extractor cannot currently measure CICFlowMeter's bulk/active/idle
+    # statistics, so a CIC-trained model is only partially comparable.
+    UNSUPPORTED_LIVE_FEATURES = (
+        "Fwd Avg Bytes/Bulk", "Fwd Avg Packets/Bulk", "Fwd Avg Bulk Rate",
+        "Bwd Avg Bytes/Bulk", "Bwd Avg Packets/Bulk", "Bwd Avg Bulk Rate",
+        "Active Mean", "Active Std", "Active Max", "Active Min",
+        "Idle Mean", "Idle Std", "Idle Max", "Idle Min",
+    )
+
     def __init__(self,
                  model_path: str,
                  feature_extractor_path: str,
@@ -276,6 +287,20 @@ class RealTimeIDSPipeline:
         # class defaults (AE_OVERRIDE_CONF / RF_OVERRIDE_CONF). Set as instance
         # attributes so they shadow the class defaults when present.
         self.AE_OVERRIDE_CONF, self.RF_OVERRIDE_CONF = self._load_override_confs(model_path)
+
+        # AE-only detection is intentionally opt-in.  It becomes appropriate
+        # only after a controlled live-lab capture has demonstrated score
+        # variation and calibrated a threshold for this exact extractor.
+        self.ae_only_alerting_validated = (
+            os.environ.get("IDS_AE_ONLY_ALERTING_VALIDATED", "false").strip().lower()
+            in {"1", "true", "yes"}
+        )
+        if self.random_forest is None and not self.ae_only_alerting_validated:
+            logger.warning(
+                "AE-only alerting is disabled until IDS_AE_ONLY_ALERTING_VALIDATED=true. "
+                "Capture and validate controlled live-lab traffic first."
+            )
+        self.evidence_origin = os.environ.get("IDS_EVIDENCE_ORIGIN", "live_unclassified")
 
         self.packet_buffer = []
         self.flow_tracker = {}
@@ -630,13 +655,14 @@ class RealTimeIDSPipeline:
             with open(self._dump_path, "a", newline="") as fh:
                 w = csv.writer(fh)
                 if new_file:
-                    w.writerow(["ts", "src_ip", "dst_ip", "dst_port", "protocol", "packets"]
+                    w.writerow(["ts", "evidence_origin", "feature_coverage", "src_ip", "dst_ip", "dst_port", "protocol", "packets"]
                                + names + ["recon_error", "rf_prob"])
                 for k, x, e, rp in zip(keys, feats, errs, rf_probs):
                     f = self.flow_tracker.get(k)
                     if f is None:
                         continue
-                    w.writerow([int(time.time()), f["init_src"], f["init_dst"], f["init_dport"],
+                    w.writerow([int(time.time()), self.evidence_origin,
+                                self._live_feature_coverage(), f["init_src"], f["init_dst"], f["init_dport"],
                                 f["protocol"], f["packets"], *[float(v) for v in x], float(e),
                                 "" if rp is None else float(rp)])
                     self._dump_rows += 1
@@ -646,6 +672,11 @@ class RealTimeIDSPipeline:
         except Exception as e:
             logger.warning(f"Feature dump failed, disabling it: {e}")
             self._dump_path = None
+
+    def _live_feature_coverage(self):
+        """Fraction of the deployed feature schema measured by this live extractor."""
+        total = int(getattr(self.feature_scaler, "n_features_in_", 78))
+        return max(0.0, (total - len(self.UNSUPPORTED_LIVE_FEATURES)) / total)
 
     def flush(self):
         """Score every finished flow now (used by verify_ensemble.py and tests)."""
@@ -795,7 +826,7 @@ class RealTimeIDSPipeline:
         fwd_flags = _flag_counts(fwd_pkts)
         bwd_flags = _flag_counts(bwd_pkts)
         all_flags = _flag_counts(all_pkts_only)
-        
+
         # CICIDS stores the *Flag Count columns as 0/1 indicators (scaler range == 1),
         # not packet counts. Emit presence, not count.
         all_flags = {k: min(v, 1) for k, v in all_flags.items()}
@@ -949,6 +980,15 @@ class RealTimeIDSPipeline:
         actually alerted, rather than the diluted average. All sub-scores are
         recorded on the alert so the dashboard (and thesis) can show the reason.
         """
+        # Do not turn an unvalidated, AE-only live path into a false-positive
+        # storm.  The RF remains available as a second opinion when deployed.
+        if rf_attack_prob is None and not self.ae_only_alerting_validated:
+            logger.warning(
+                "Suppressing AE-only result: live score variance has not been validated "
+                "(set IDS_AE_ONLY_ALERTING_VALIDATED=true only after live-lab validation)."
+            )
+            return
+
         ae_score = recon_error / (recon_error + self.recon_threshold)
 
         override_reason = None
@@ -1042,6 +1082,9 @@ class RealTimeIDSPipeline:
                 'packet_count': flow['packets'],
                 'bytes_transferred': flow['bytes'],
                 'flow_duration': (flow['last_seen'] - flow['first_seen']).total_seconds(),
+                'feature_coverage': self._live_feature_coverage(),
+                'unsupported_live_features': list(self.UNSUPPORTED_LIVE_FEATURES),
+                'evidence_origin': getattr(self, 'evidence_origin', 'live_unclassified'),
                 # alerts from this source swallowed by the cooldown since the previous one
                 'suppressed_since_last': suppressed,
             }
