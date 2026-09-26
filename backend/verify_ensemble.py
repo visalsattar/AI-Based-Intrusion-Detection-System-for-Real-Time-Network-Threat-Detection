@@ -127,6 +127,7 @@ def run_scenarios(pipeline, tee, say=print):
     # Pin behaviour: no Redis-stored settings, and the IPS can never touch the firewall here.
     pipeline._settings_cache, pipeline._settings_loaded_at = {"autoBlock": False}, time.time() + 10**9
     pipeline.redis_client = tee
+    pipeline.evidence_origin = "synthetic_fusion_verification"
     ok, results, t0 = True, [], 1_700_000_000.0
 
     for n, (title, build, expected) in enumerate(SCENARIOS, 1):
@@ -187,6 +188,11 @@ def training_row_smoke_test(pipeline, say=print):
 
 
 def main():
+    # Evidence emitted by this script is constructed plumbing-test output, not
+    # a network capture.  The evidence card and JSONL record carry this label.
+    # The verifier intentionally exercises AE-only fusion branches.  This is
+    # safe here because its evidence is explicitly synthetic.
+    os.environ["IDS_AE_ONLY_ALERTING_VALIDATED"] = "true"
     if not (os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH)):
         print("Model artifacts missing (backend/models/autoencoder.h5, feature_scaler.pkl). "
               "Download them from the release or train first.")
