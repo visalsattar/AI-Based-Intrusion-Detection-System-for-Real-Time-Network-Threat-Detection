@@ -15,7 +15,7 @@
   border-bottom: 1px solid var(--panel-border, rgba(255, 255, 255, 0.08));
   position: sticky;
   top: 0;
-  z-index: 50;
+  z-index: 1100;
   backdrop-filter: blur(10px);
 }
 

@@ -1,19 +1,25 @@
-# frontend/Dockerfile
-# Use official Node.js image
-FROM node:18-alpine
+# frontend/Dockerfile — DEVELOPMENT MODE ONLY
+#
+# This Dockerfile runs the React dev server (hot-reload, source maps).
+# It is NOT used by docker-compose.yml for normal operation.
+#
+# For production / demo:
+#   docker-compose up --build
+#   (React is compiled inside backend/Dockerfile via the multi-stage build)
+#
+# For frontend-only development against a locally running Flask backend:
+#   docker build -t ids-frontend . && docker run -p 3000:3000 ids-frontend
+#   (Flask must be running on the host at port 5000 for the proxy to work)
 
-# Set working directory
+FROM node:20-slim
+
 WORKDIR /app
 
-# Copy package.json and install dependencies
-COPY package.json package-lock.json ./
-RUN npm install
+COPY package*.json ./
+RUN npm ci
 
-# Copy the rest of the React code
 COPY . .
 
-# Expose the React development port
 EXPOSE 3000
 
-# Start the React app
 CMD ["npm", "start"]

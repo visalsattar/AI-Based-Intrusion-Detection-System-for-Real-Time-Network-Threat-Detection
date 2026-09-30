@@ -1,8 +1,6 @@
-# IDS Dashboard (React Frontend)
+# Frontend - AI-Based IDS Dashboard
 
-Real-time dashboard for the AI-Based Intrusion Detection System. Connects
-to the Flask backend via WebSocket (`socket.io-client`) and renders live
-alerts as they arrive.
+React dashboard for the AI-Based Intrusion Detection System. It displays alert history, live alerts, traffic charts, threat intelligence, and system settings.
 
 ## Setup
 
@@ -11,39 +9,62 @@ npm install
 npm start
 ```
 
-By default connects to `http://localhost:5000`. Override with:
+The development dashboard is available at `http://localhost:3000` and uses the Create React App proxy to reach the backend at `http://localhost:5000`.
+
+For a production build:
+
 ```bash
-REACT_APP_SOCKET_URL=http://your-backend-host:5000 npm start
+npm run build
 ```
 
-## Known limitations
+The frontend currently connects to Socket.IO with a relative URL (`io('/')`), so `REACT_APP_SOCKET_URL` is not a supported configuration variable.
 
-- **`public/alert.mp3` is an empty placeholder (0 bytes).** The dashboard
-  attempts to play this file on a CRITICAL alert; the call fails silently
-  (caught in `Dashboard.jsx`) until a real short audio file is placed at
-  this path. No sound currently plays on critical alerts.
-- **"Session Alert Rate"** on the dashboard is a real ratio (critical+high
-  alerts / total alerts seen this browser session) — it is NOT the same
-  as a true detection rate, which would require ground-truth labels the
-  live dashboard does not have access to. See the backend's
-  `docs/CHANGES.md` and Thesis Chapter 7 for the model's real, ground-truth
-  evaluated metrics.
-- This component only consumes the WebSocket `new_alert` stream. It does
-  not call the backend's `/api/dashboard` REST endpoint, which exists
-  for potential future use (e.g. fetching alert history on page load)
-  but is not currently wired into the UI.
+## Pages
+
+| Page | File | Description |
+| :--- | :--- | :--- |
+| Dashboard | `src/pages/Dashboard.jsx` | Live alerts, metrics, traffic charts, system health, and network devices |
+| Threat Intel | `src/pages/ThreatIntel.jsx` | Threat intelligence data and map view |
+| History | `src/pages/History.jsx` | Searchable and filterable alert history |
+| Settings | `src/pages/Settings.jsx` | IDS and system configuration |
 
 ## Structure
 
 ```
 src/
-├── App.jsx                    # Mounts Dashboard
+├── App.jsx                        # Router and page mounting
+├── index.js                       # React entry point
 ├── components/
-│   ├── Dashboard.jsx           # Main container, socket connection, signal-pulse indicator
-│   ├── MetricCard.jsx          # Small stat card
-│   ├── Charts.jsx              # Alert-volume-over-time line chart (recharts)
-│   └── AlertTable.jsx          # Live alert log
+│   ├── AlertTable.jsx             # Alert log table
+│   ├── Charts.jsx                 # Alert charts
+│   ├── MetricCard.jsx             # Dashboard metric card
+│   ├── Navbar.jsx                 # Main navigation
+│   └── TrafficCharts.jsx          # Traffic visualisations
+├── pages/
+│   ├── Dashboard.jsx              # Main dashboard and live alerts
+│   ├── History.jsx                # Historical alerts
+│   ├── Settings.jsx               # Configuration panel
+│   └── ThreatIntel.jsx            # Threat intelligence
 └── styles/
-    ├── global.css               # Design tokens (colors, fonts)
-    └── Dashboard.css            # Component styles
+    ├── global.css                 # Global styles and design tokens
+    ├── Dashboard.css              # Dashboard layout
+    ├── Navbar.css                 # Navigation styles
+    └── Pages.css                  # Shared page styles
 ```
+
+## Data Flow
+
+1. The frontend loads initial data from backend REST endpoints such as `/api/history`, `/api/health`, and `/api/network-devices`.
+2. The backend reads alerts from the Redis `ids:alerts` stream and emits live `new_alert` events through Flask-SocketIO.
+3. `Dashboard.jsx` and `History.jsx` receive those events and update their views without a page refresh.
+
+## Tests
+
+```bash
+npm test
+```
+
+## Known Limitations
+
+* The UI uses REST endpoints for initial data and settings, and Socket.IO for live alert updates.
+* The session alert rate is a session-level UI metric, not a ground-truth model detection rate. Model metrics are documented by the backend.

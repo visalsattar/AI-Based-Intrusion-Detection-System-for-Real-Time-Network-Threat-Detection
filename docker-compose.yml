@@ -1,41 +1,89 @@
+# Web dashboard + Redis by default. Live packet capture is a separate, opt-in service.
+#
+#   docker compose up --build                       # dashboard + Redis (needs REDIS_PASSWORD in .env)
+#   docker compose --profile capture up --build     # + sniffer  (LINUX HOST ONLY, see below)
+#
+# Why the sniffer is separate: a container on the default bridge network only sees its own
+# namespace (dashboard <-> Redis traffic), never your LAN. Capturing real traffic needs the
+# host's network namespace. `network_mode: host` gives that on Linux; on Docker Desktop
+# (Windows/macOS) "host" is the Linux VM, not your NIC -- run the sniffer natively instead:
+#
+#   set REDIS_HOST=127.0.0.1 & set REDIS_PORT=6380 & set REDIS_PASSWORD=<same as .env>
+#   python backend/main.py --mode ids --interface "<adapter name>"        (Npcap installed)
 services:
-  # 1. The Redis Database
   redis:
     image: redis:alpine
-    command: redis-server --protected-mode no
+    command: redis-server --requirepass ${REDIS_PASSWORD:?set REDIS_PASSWORD in root .env}
+    environment:
+      - REDISCLI_AUTH=${REDIS_PASSWORD}
     ports:
-      - "6380:6379"
+      - "127.0.0.1:6380:6379"
     restart: always
     healthcheck:
-      # Confirms Redis is actually accepting connections, not just that
-      # the container process has started. 'depends_on' alone only waits
-      # for the container to start, which is what caused the DNS-lookup
-      # race in main.py's _connect_redis() -- the backend would start
-      # trying to resolve 'redis' before Redis itself was really ready.
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
       interval: 2s
       timeout: 2s
       retries: 10
       start_period: 5s
 
-  # 2. The Unified Web Dashboard & API (Flask + React, built in one image)
   backend:
     build:
       context: .
       dockerfile: backend/Dockerfile
+      args:
+        REACT_APP_CARTO_KEY: ${REACT_APP_CARTO_KEY:-}
     ports:
-      - "3000:5000"
+      - "127.0.0.1:5000:5000"
     env_file:
-      - ./backend/.env
+      - path: ./backend/.env
+        required: false
     environment:
       - REDIS_HOST=redis
-      - AUTO_CAPTURE=true
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - IDS_API_TOKEN=${IDS_API_TOKEN:-}
+      # The container binds 0.0.0.0 internally; the port above is published on host
+      # loopback only, so running without a token is an explicit, scoped choice.
+      # Remove this line (and set IDS_API_TOKEN) before publishing beyond 127.0.0.1.
+      - IDS_ALLOW_UNAUTHENTICATED=${IDS_ALLOW_UNAUTHENTICATED:-true}
+      - AUTO_CAPTURE=false
+    volumes:
+      # models are not in git (see .gitignore); mount them instead of baking them into the image
+      - ./backend/models:/app/models:ro
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  sniffer:
+    profiles: ["capture"]
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["python", "main.py", "--mode", "ids", "--interface", "${CAPTURE_INTERFACE:-auto}"]
+    user: root                    # raw sockets need it; keep this service tiny and separate
+    network_mode: host            # Linux only: sees the host's real interfaces
+    environment:
+      - REDIS_HOST=127.0.0.1
+      - REDIS_PORT=6380           # host-side port of the redis service above
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - IDS_WHITELIST=${IDS_WHITELIST:-}
+    volumes:
+      - ./backend/models:/app/models:ro
+      - ./backend/evidence:/app/evidence
+    tmpfs:
+      - /app/logs                 # root without CAP_DAC_OVERRIDE can't write ids-owned dirs
+    cap_drop:
+      - ALL
     cap_add:
-      # Required for Scapy to actually open a raw capture socket.
-      # Without these, real packet capture silently fails to bind --
-      # the dashboard would run, but never see real traffic.
-      - NET_ADMIN
       - NET_RAW
+      # - NET_ADMIN               # ONLY if you turn on Automatic IP Blocking: with host
+      #                           # networking the DROP rules land in the HOST firewall.
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
     depends_on:
       redis:

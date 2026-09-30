@@ -1,11 +1,18 @@
 # .dockerignore (PROJECT ROOT)
-# Build context is now the project root (docker-compose.yml ->
-# backend.build.context: .), so .dockerignore must live here, not in
-# backend/, for either stage of the multi-stage build to respect it.
+# Build context is the project root (docker-compose.yml -> context: .)
+# so this file must live here, not in backend/, for Docker to respect it.
 
-# --- Secrets: never baked into an image layer ---
-backend/.env
-backend/.env.local
+# --- Secrets: never sent to the Docker build context ---
+.env
+*.env
+.env.*
+*.env.local
+
+# --- Secrets: never sent to Docker build context ---
+.env
+*.env
+.env.*
+*.env.local
 
 # --- Backend dev junk, not needed inside the image ---
 backend/__pycache__/
@@ -13,7 +20,9 @@ backend/**/__pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+backend/.pytest_cache/
 backend/logs/
+backend/config/whitelist.json
 *.log
 backend/tests/
 backend/data/
@@ -23,6 +32,14 @@ backend/data/
 # copied in either, since the builder stage regenerates it ---
 frontend/node_modules/
 frontend/build/
+
+# --- Root-level extras not needed inside the image ---
+node_modules/
+Thesis/
+*.bat
+simulate_attack.py
+*.md
+.vscode/
 
 # --- General ---
 .git/

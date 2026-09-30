@@ -1,22 +1,30 @@
 name: Backend Tests
 
-# Runs the IDS backend pytest suite (preprocessing, sequence-builder
-# leakage checks, and live-inference/ensemble tests) on every push and PR.
+# Runs the IDS backend pytest suite on every push and PR, against the REAL trained models
+# (downloaded from the GitHub release -- they are gitignored, so a bare checkout has none).
+# A skipped test fails the build: a green check must mean the tests actually ran.
 on:
   push:
     branches: ["**"]
     paths:
       - "backend/**"
+      - "frontend/**"
+      - "docker-compose.yml"
       - ".github/workflows/backend-tests.yml"
   pull_request:
     paths:
       - "backend/**"
+      - "frontend/**"
+      - "docker-compose.yml"
       - ".github/workflows/backend-tests.yml"
+
+permissions:
+  contents: read
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: Check out repository
@@ -35,12 +43,60 @@ jobs:
         # the dependency set resolves cleanly on a clean machine.
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Syntax check
+        run: python -m compileall -q backend
+
+      - name: Download trained models from the release
+        # backend/models/*.h5 and *.pkl are in .gitignore, so checkout does not contain them.
+        # Without this step every test in test_inference.py is skipped.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download v1.0-models --repo "$GITHUB_REPOSITORY" \
+            --dir backend/models --pattern '*.h5' --pattern '*.pkl' --clobber
+          ls -l backend/models
 
       - name: Run test suite
         working-directory: backend
-        # -p no:warnings keeps the log readable (TF/sklearn are noisy). The
-        # inference tests auto-skip if model artifacts are missing, but they
-        # are committed under backend/models, so they run for real here.
+        # -p no:warnings keeps the log readable (TF/sklearn are noisy).
+        run: python -m pytest tests/ -v -p no:warnings --junitxml=report.xml
+
+      - name: Fail if any test was skipped
+        working-directory: backend
         run: |
-          python -m pytest tests/ -v -p no:warnings
+          python - <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse("report.xml").getroot()
+          suite = root if root.tag == "testsuite" else root.find("testsuite")
+          tests, skipped = int(suite.get("tests", 0)), int(suite.get("skipped", 0))
+          print(f"{tests} tests, {skipped} skipped")
+          sys.exit(1 if skipped or tests == 0 else 0)
+          PY
+
+  secrets:
+    # Fails the build if a credential ever lands in the repo again (scans full history).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  docker:
+    # `docker compose up` is the documented way to run this; make sure it still builds.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compose file is valid (with and without the capture profile)
+        env:
+          REDIS_PASSWORD: ci-only-not-a-secret
+        run: |
+          docker compose config -q
+          docker compose --profile capture config -q
+      - name: Image builds
+        run: docker build -f backend/Dockerfile -t ids-backend:ci .
