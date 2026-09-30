@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 
 from flask import jsonify, request
 import psutil
+from redis.exceptions import RedisError
 
 from geo_utils import get_ip_location, reload_reader
 import geo_utils
@@ -31,6 +32,10 @@ DEFAULT_SETTINGS = {
     "highThreshold": 0.85,
 }
 
+# Errors worth retrying: Redis down/timeout (redis-py raises RedisError subclasses; raw socket
+# failures surface as OSError). Anything else -- e.g. corrupt JSON -- will not fix itself.
+_TRANSIENT_ERRORS = (RedisError, OSError)
+
 
 def allowed_origins() -> list:
     """Browser origins allowed to call the mutating API and to open the Socket.IO channel."""
@@ -39,6 +44,29 @@ def allowed_origins() -> list:
         "http://localhost:5000,http://127.0.0.1:5000,http://localhost:3000,http://127.0.0.1:3000",
     )
     return [o.strip().rstrip("/") for o in raw.split(",") if o.strip()]
+
+
+def allowed_hosts() -> set:
+    """
+    Host names the API answers to. This is the DNS-rebinding defence: a hostile page whose domain
+    re-resolves to 127.0.0.1 still sends its own domain in the Host header, so it is rejected here.
+    Loopback names, every host in IDS_ALLOWED_ORIGINS, and anything in IDS_ALLOWED_HOSTS
+    (comma-separated, e.g. the LAN IP you open the dashboard on) are accepted.
+    """
+    hosts = {"localhost", "127.0.0.1", "::1"}
+    for origin in allowed_origins():
+        name = urlparse(origin).hostname
+        if name:
+            hosts.add(name.lower())
+    for h in os.environ.get("IDS_ALLOWED_HOSTS", "").split(","):
+        h = h.strip().strip("[]").lower()
+        if h:
+            hosts.add(h)
+    return hosts
+
+
+def _request_hostname():
+    return urlparse("//" + (request.host or "")).hostname
 
 
 def _num(lo, hi, cast):
@@ -99,6 +127,9 @@ def startup_auth_error(bind: str, token: str, allow_unauthenticated: bool):
     send no Origin header, so the Origin check does not stop them). The only way to
     run like that is the explicit IDS_ALLOW_UNAUTHENTICATED=true opt-out, meant for a
     container whose port is published on host loopback only.
+
+    Note: the token guards state-changing requests only. GET routes (alerts, ARP table,
+    threat intel, system info) remain readable by anything that can reach the port.
     """
     import ipaddress
     host = (bind or "").strip().strip("[]")
@@ -158,17 +189,32 @@ def _read_alerts_from_redis(redis_client, count=200):
         return []
 
 
-def _load_settings(redis_client) -> dict:
+def _load_settings(redis_client, strict: bool = False) -> dict:
+    """
+    Defaults overlaid with whatever valid values are stored in Redis. Stored values go through
+    the same schema as incoming ones, so a bad or stale value falls back to its default instead
+    of breaking comparisons later.
+
+    strict=False (display paths): Redis/JSON errors are logged and defaults are returned.
+    strict=True (write paths): errors are raised, so a caller never persists defaults over the
+    user's real settings just because one read failed.
+    """
     settings = dict(DEFAULT_SETTINGS)
-    if redis_client:
-        try:
-            stored = redis_client.get('ids:settings')
-            if stored:
-                saved = json.loads(stored)
-                saved.pop("abuseIPDBKey", None)  # discard legacy plaintext keys
-                settings.update(saved)
-        except Exception as e:
-            logger.warning(f"Could not read settings from Redis: {e}")
+    if not redis_client:
+        return settings
+    try:
+        stored = redis_client.get('ids:settings')
+        saved = json.loads(stored) if stored else {}
+    except Exception as e:
+        if strict:
+            raise
+        logger.warning(f"Could not read settings from Redis: {e}")
+        return settings
+    if isinstance(saved, dict):
+        clean, errors = validate_settings(saved)
+        if errors:
+            logger.warning(f"Ignoring invalid stored settings: {errors}")
+        settings.update(clean)
     return settings
 
 
@@ -188,15 +234,21 @@ def migrate_legacy_settings(redis_client) -> bool:
 
 
 def migrate_legacy_settings_until_done(redis_client, sleep=_sleep, interval=30.0) -> None:
-    """Background task: retry until the migration succeeds once. Never blocks startup."""
+    """Background task: retry transient Redis failures until the migration runs once.
+    Non-transient errors (e.g. corrupt JSON in ids:settings) are logged once and abandoned --
+    retrying them would loop forever. Never blocks startup."""
     while True:
         try:
             if migrate_legacy_settings(redis_client):
                 logger.warning("Removed a legacy AbuseIPDB key from Redis settings; configure it in backend/.env.")
             return
-        except Exception as e:
+        except _TRANSIENT_ERRORS as e:
             logger.warning(f"Legacy AbuseIPDB cleanup pending (Redis unavailable: {e}); retrying in {interval:.0f}s")
             sleep(interval)
+        except Exception as e:
+            logger.error(f"Legacy AbuseIPDB cleanup abandoned: ids:settings is unreadable ({e}). "
+                         "Inspect or delete the key manually.")
+            return
 
 
 def register_routes(app, redis_client=None):
@@ -218,20 +270,27 @@ def register_routes(app, redis_client=None):
         except Exception:
             return False
 
-    # ---------------- Guard for state-changing requests ----------------
+    # ---------------- Guard for every /api/ request ----------------
 
     @app.before_request
-    def _guard_mutations():
+    def _guard_api():
         """
-        POST/PUT/PATCH/DELETE under /api/ can wipe the alert log, change severity thresholds and
-        switch automatic firewall blocking on, so they are guarded:
-          1. Browser requests must come from this app's own origin (or IDS_ALLOWED_ORIGINS).
-          2. If IDS_API_TOKEN is set, every mutating request needs `Authorization: Bearer <token>`.
-        Set IDS_API_TOKEN whenever the dashboard is reachable beyond loopback. This guard covers
-        Flask's HTTP routes only; the Socket.IO connection is authenticated separately in main.py
-        (socket_authorized), using the same IDS_API_TOKEN.
+        1. Every /api/ request must name an allowed Host (DNS-rebinding defence; covers GETs too,
+           since a rebound page could otherwise read alerts and the ARP table).
+        2. POST/PUT/PATCH/DELETE can wipe the alert log, change severity thresholds and switch
+           automatic firewall blocking on, so additionally:
+           a. Browser requests must come from this app's own origin (or IDS_ALLOWED_ORIGINS).
+              Matching Origin against Host is safe only because Host was validated in step 1.
+           b. If IDS_API_TOKEN is set, they need `Authorization: Bearer <token>`.
+        This guard covers Flask's HTTP routes only; the Socket.IO connection is authenticated
+        separately in main.py (socket_authorized), using the same IDS_API_TOKEN.
         """
-        if request.method not in ("POST", "PUT", "PATCH", "DELETE") or not request.path.startswith("/api/"):
+        if not request.path.startswith("/api/"):
+            return None
+        hostname = _request_hostname()
+        if not hostname or hostname.lower() not in allowed_hosts():
+            return jsonify({"status": "error", "message": "Host not allowed"}), 403
+        if request.method not in ("POST", "PUT", "PATCH", "DELETE"):
             return None
         origin = request.headers.get("Origin")
         if origin:
@@ -249,13 +308,16 @@ def register_routes(app, redis_client=None):
 
     @app.route('/api/health', methods=['GET'])
     def health_check():
-        return jsonify({
-            'status': 'running',
-            'cpu': psutil.cpu_percent(interval=0.1),
+        redis_ok = _redis_up()
+        body = {
+            'status': 'running' if redis_ok else 'degraded',
+            # interval=None is non-blocking: compares against the previous call (0.0 on the first).
+            'cpu': psutil.cpu_percent(interval=None),
             'ram': psutil.virtual_memory().percent,
             'disk': psutil.disk_usage('/').percent,
-            'redis': 'connected' if _redis_up() else 'disconnected',
-        })
+            'redis': 'connected' if redis_ok else 'disconnected',
+        }
+        return jsonify(body), (200 if redis_ok else 503)
 
     # ---------------- Alerts ----------------
 
@@ -364,7 +426,12 @@ def register_routes(app, redis_client=None):
             return jsonify({'status': 'error', 'message': 'Expected a JSON object'}), 400
 
         clean, errors = validate_settings(incoming)
-        current = _load_settings(redis_client)
+        try:
+            current = _load_settings(redis_client, strict=True)
+        except Exception as e:
+            # Never merge into defaults and write them back: that silently wipes saved settings.
+            logger.error(f"Could not read current settings before save: {e}")
+            return jsonify({'status': 'error', 'message': 'Redis unavailable -- settings not saved'}), 503
         current.update(clean)
         if current['highThreshold'] >= current['criticalThreshold']:
             errors.append("highThreshold: must be lower than criticalThreshold")
