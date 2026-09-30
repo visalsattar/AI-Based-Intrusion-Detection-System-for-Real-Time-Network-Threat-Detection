@@ -79,7 +79,7 @@ from ids_pipeline import RealTimeIDSPipeline
 from redis_alert_bridge import start_redis_alert_bridge, ALERT_ROOM
 from network_utils import list_interfaces
 from redis_util import make_redis
-from routes import register_routes, allowed_origins, enforce_startup_auth
+from routes import migrate_legacy_settings_until_done, register_routes, allowed_origins, enforce_startup_auth
 
 # 6. Global Application Initialization
 # Initialize Flask using the absolute path to the React frontend
@@ -291,6 +291,8 @@ def run_production_dashboard():
     process. Off by default since it needs raw-socket privileges
     (NET_RAW/NET_ADMIN) that most container hosts don't grant unless asked."""
     enforce_startup_auth()
+    if redis_client:
+        socketio.start_background_task(migrate_legacy_settings_until_done, redis_client)
     logger.info("Loading Dashboard API and React Frontend...")
 
     @app.route('/', defaults={'path': ''})

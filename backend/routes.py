@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from collections import defaultdict
+from time import sleep as _sleep
 from urllib.parse import urlparse
 
 from flask import jsonify, request
@@ -111,6 +112,7 @@ def startup_auth_error(bind: str, token: str, allow_unauthenticated: bool):
             "Set IDS_API_TOKEN, bind to 127.0.0.1, or (container published on host "
             "loopback only) set IDS_ALLOW_UNAUTHENTICATED=true.")
 
+
 def enforce_startup_auth(env=None) -> None:
     """Refuse to start when the dashboard would be reachable without authentication.
     Reads IDS_BIND / IDS_API_TOKEN / IDS_ALLOW_UNAUTHENTICATED from env (default os.environ)."""
@@ -124,13 +126,12 @@ def enforce_startup_auth(env=None) -> None:
         logging.getLogger("IDS-Orchestrator").error(err)
         raise SystemExit(1)
 
+
 def validate_settings(incoming: dict):
-    """Returns (clean, errors). A blank abuseIPDBKey means 'keep the saved one'."""
+    """Returns (clean, errors). Keys outside SETTINGS_SCHEMA are ignored."""
     clean, errors = {}, []
     for key, check in SETTINGS_SCHEMA.items():
         if key not in incoming:
-            continue
-        if key == "abuseIPDBKey" and not incoming[key]:
             continue
         try:
             clean[key] = check(incoming[key])
@@ -171,6 +172,33 @@ def _load_settings(redis_client) -> dict:
     return settings
 
 
+def migrate_legacy_settings(redis_client) -> bool:
+    """Atomically strip a plaintext abuseIPDBKey from ids:settings.
+    Returns True if a key was removed. Raises on Redis errors so callers can retry."""
+    def _tx(pipe):
+        stored = pipe.get('ids:settings')
+        legacy = json.loads(stored) if stored else {}
+        if not (isinstance(legacy, dict) and 'abuseIPDBKey' in legacy):
+            return False
+        legacy.pop('abuseIPDBKey')
+        pipe.multi()
+        pipe.set('ids:settings', json.dumps(legacy))
+        return True
+    return redis_client.transaction(_tx, 'ids:settings', value_from_callable=True)
+
+
+def migrate_legacy_settings_until_done(redis_client, sleep=_sleep, interval=30.0) -> None:
+    """Background task: retry until the migration succeeds once. Never blocks startup."""
+    while True:
+        try:
+            if migrate_legacy_settings(redis_client):
+                logger.warning("Removed a legacy AbuseIPDB key from Redis settings; configure it in backend/.env.")
+            return
+        except Exception as e:
+            logger.warning(f"Legacy AbuseIPDB cleanup pending (Redis unavailable: {e}); retrying in {interval:.0f}s")
+            sleep(interval)
+
+
 def register_routes(app, redis_client=None):
     """
     Registers JSON API routes consumed by the React dashboard.
@@ -179,18 +207,16 @@ def register_routes(app, redis_client=None):
     by RealTimeIDSPipeline once packet capture is running), the real
     AbuseIPDB API, the real on-disk GeoIP/model status, and real OS-level
     network introspection. There is no mock/demo data path.
+
+    Performs no Redis I/O itself: registration runs at import time in main.py.
     """
 
-    # Migrate credentials written by older versions out of the Redis settings document.
-    if redis_client:
+    def _redis_up() -> bool:
+        # The client is lazy and always truthy; only a round-trip proves Redis is reachable.
         try:
-            stored = redis_client.get('ids:settings')
-            legacy = json.loads(stored) if stored else {}
-            if isinstance(legacy, dict) and legacy.pop('abuseIPDBKey', None):
-                redis_client.set('ids:settings', json.dumps(legacy))
-                logger.warning("Removed a legacy AbuseIPDB key from Redis settings; configure it in backend/.env.")
-        except Exception as e:
-            logger.warning(f"Could not clean legacy AbuseIPDB settings: {e}")
+            return bool(redis_client and redis_client.ping())
+        except Exception:
+            return False
 
     # ---------------- Guard for state-changing requests ----------------
 
@@ -201,9 +227,9 @@ def register_routes(app, redis_client=None):
         switch automatic firewall blocking on, so they are guarded:
           1. Browser requests must come from this app's own origin (or IDS_ALLOWED_ORIGINS).
           2. If IDS_API_TOKEN is set, every mutating request needs `Authorization: Bearer <token>`.
-        Set IDS_API_TOKEN whenever the dashboard is reachable beyond loopback. Note this only
-        covers Flask's HTTP routes -- the Socket.IO connection (read-only: it streams alerts to
-        anyone who can open a websocket) is not gated by it.
+        Set IDS_API_TOKEN whenever the dashboard is reachable beyond loopback. This guard covers
+        Flask's HTTP routes only; the Socket.IO connection is authenticated separately in main.py
+        (socket_authorized), using the same IDS_API_TOKEN.
         """
         if request.method not in ("POST", "PUT", "PATCH", "DELETE") or not request.path.startswith("/api/"):
             return None
@@ -228,7 +254,7 @@ def register_routes(app, redis_client=None):
             'cpu': psutil.cpu_percent(interval=0.1),
             'ram': psutil.virtual_memory().percent,
             'disk': psutil.disk_usage('/').percent,
-            'redis': 'connected' if redis_client else 'disconnected',
+            'redis': 'connected' if _redis_up() else 'disconnected',
         })
 
     # ---------------- Alerts ----------------
@@ -242,7 +268,7 @@ def register_routes(app, redis_client=None):
 
     @app.route('/api/history', methods=['DELETE'])
     def clear_history():
-        """Backs the 'Clear Logs' button — actually trims the real Redis stream."""
+        """Backs the 'Clear Logs' button -- deletes the real Redis alert stream."""
         if not redis_client:
             return jsonify({'status': 'error', 'message': 'Redis unavailable'}), 503
         try:
@@ -250,7 +276,7 @@ def register_routes(app, redis_client=None):
             return jsonify({'status': 'success', 'message': 'Alert history cleared'})
         except Exception as e:
             logger.error(f"Failed to clear history: {e}")
-            return jsonify({'status': 'error', 'message': str(e)}), 500
+            return jsonify({'status': 'error', 'message': 'Failed to clear history'}), 500
 
     # ---------------- Threat Intelligence (real AbuseIPDB) ----------------
 
@@ -272,7 +298,7 @@ def register_routes(app, redis_client=None):
             if severity_rank.get(sev, 0) > severity_rank.get(bucket['severity'], 0):
                 bucket['severity'] = sev
 
-        # Most active IPs first, capped — each uncached IP costs one real AbuseIPDB call
+        # Most active IPs first, capped -- each uncached IP costs one real AbuseIPDB call
         ranked_ips = sorted(by_ip.keys(), key=lambda ip: by_ip[ip]['hits'], reverse=True)
         abuse_results = {r['ip']: r for r in threat_intel_service.lookup_many(ranked_ips, redis_client)}
 
@@ -326,7 +352,7 @@ def register_routes(app, redis_client=None):
     @app.route('/api/settings', methods=['GET'])
     def get_settings():
         settings = _load_settings(redis_client)
-        # Never echo the raw API key back to the client beyond a masked preview
+        # Never echo the raw API key; only report whether one is configured in the environment
         settings['abuseIPDBKeySet'] = bool(os.environ.get('ABUSEIPDB_API_KEY'))
         settings.pop('abuseIPDBKey', None)
         return jsonify(settings)
@@ -349,8 +375,8 @@ def register_routes(app, redis_client=None):
                 redis_client.set('ids:settings', json.dumps(current))
             except Exception as e:
                 logger.error(f"Failed to persist settings: {e}")
-                return jsonify({'status': 'error', 'message': str(e)}), 500
+                return jsonify({'status': 'error', 'message': 'Failed to persist settings'}), 500
         else:
-            return jsonify({'status': 'error', 'message': 'Redis unavailable — settings not persisted'}), 503
+            return jsonify({'status': 'error', 'message': 'Redis unavailable -- settings not persisted'}), 503
 
         return jsonify({'status': 'success', 'message': 'Configuration updated'})
