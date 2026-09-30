@@ -79,7 +79,7 @@ from ids_pipeline import RealTimeIDSPipeline
 from redis_alert_bridge import start_redis_alert_bridge, ALERT_ROOM
 from network_utils import list_interfaces
 from redis_util import make_redis
-from routes import register_routes, allowed_origins
+from routes import register_routes, allowed_origins, enforce_startup_auth
 
 # 6. Global Application Initialization
 # Initialize Flask using the absolute path to the React frontend
@@ -290,6 +290,7 @@ def run_production_dashboard():
     container can both detect and display intrusions without a second
     process. Off by default since it needs raw-socket privileges
     (NET_RAW/NET_ADMIN) that most container hosts don't grant unless asked."""
+    enforce_startup_auth()
     logger.info("Loading Dashboard API and React Frontend...")
 
     @app.route('/', defaults={'path': ''})

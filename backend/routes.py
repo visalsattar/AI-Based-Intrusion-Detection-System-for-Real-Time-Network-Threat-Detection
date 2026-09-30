@@ -111,6 +111,18 @@ def startup_auth_error(bind: str, token: str, allow_unauthenticated: bool):
             "Set IDS_API_TOKEN, bind to 127.0.0.1, or (container published on host "
             "loopback only) set IDS_ALLOW_UNAUTHENTICATED=true.")
 
+def enforce_startup_auth(env=None) -> None:
+    """Refuse to start when the dashboard would be reachable without authentication.
+    Reads IDS_BIND / IDS_API_TOKEN / IDS_ALLOW_UNAUTHENTICATED from env (default os.environ)."""
+    env = os.environ if env is None else env
+    err = startup_auth_error(
+        env.get("IDS_BIND", "127.0.0.1"),
+        env.get("IDS_API_TOKEN", ""),
+        env.get("IDS_ALLOW_UNAUTHENTICATED", "false").strip().lower() in {"1", "true", "yes"},
+    )
+    if err:
+        logging.getLogger("IDS-Orchestrator").error(err)
+        raise SystemExit(1)
 
 def validate_settings(incoming: dict):
     """Returns (clean, errors). A blank abuseIPDBKey means 'keep the saved one'."""

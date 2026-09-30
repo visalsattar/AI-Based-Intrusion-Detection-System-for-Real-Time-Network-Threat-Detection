@@ -10,7 +10,41 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from ids_pipeline import RealTimeIDSPipeline  # noqa: E402
 from routes import startup_auth_error  # noqa: E402
 
+import pytest
+from routes import enforce_startup_auth
 
+def test_enforce_refuses_public_bind_without_token():
+    with pytest.raises(SystemExit):
+        enforce_startup_auth({"IDS_BIND": "0.0.0.0"})
+
+def test_enforce_allows_loopback_without_token():
+    enforce_startup_auth({"IDS_BIND": "127.0.0.1"})
+
+def test_enforce_allows_public_bind_with_token():
+    enforce_startup_auth({"IDS_BIND": "0.0.0.0", "IDS_API_TOKEN": "s3cret"})
+
+def test_enforce_explicit_opt_out_is_honoured():
+    enforce_startup_auth({"IDS_BIND": "0.0.0.0", "IDS_ALLOW_UNAUTHENTICATED": "true"})
+    
+import subprocess
+
+@pytest.mark.parametrize("mode", ["ids", "dashboard"])
+def test_main_module_imports_cleanly(mode):
+    """Catches import-order and missing-name errors in main.py, which no unit test loads."""
+    backend = os.path.join(os.path.dirname(__file__), "..")
+    env = {
+        **os.environ,
+        "REDIS_HOST": "127.0.0.1",
+        "REDIS_PORT": "1",          # refused instantly instead of a connect timeout
+        "TF_CPP_MIN_LOG_LEVEL": "3",
+        "IDS_API_TOKEN": "",
+    }
+    r = subprocess.run(
+        [sys.executable, "-c",
+         f"import sys; sys.argv=['main.py','--mode','{mode}']; import main"],
+        cwd=backend, env=env, capture_output=True, text=True, timeout=120,
+    )
+    assert r.returncode == 0, r.stderr[-2000:]
 class TestStartupAuthGate:
     @pytest.mark.parametrize("bind", ["127.0.0.1", "localhost", "::1", "[::1]", "127.0.0.53"])
     def test_loopback_without_token_is_allowed(self, bind):
@@ -25,7 +59,6 @@ class TestStartupAuthGate:
 
     def test_explicit_opt_out_is_allowed(self):
         assert startup_auth_error("0.0.0.0", "", True) is None
-
 
 class TestCaptureFilterScope:
     def test_plumbing_ports_excluded_only_for_local_hosts(self, monkeypatch):
@@ -65,3 +98,4 @@ class TestCaptureFilterScope:
             if "tcpdump" in str(e).lower() or "libpcap" in str(e).lower():
                 pytest.skip(str(e))
             raise
+
