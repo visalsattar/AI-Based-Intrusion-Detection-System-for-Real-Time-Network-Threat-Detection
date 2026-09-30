@@ -71,9 +71,10 @@ def build_cnn_sequences(preprocessed_csv_path: str,
     (no shuffle, preserving row order) -> build windows independently
     within each split.
 
-    Returns flat splits too, so the autoencoder/RF can reuse the exact
-    same underlying row split as the CNN, keeping evaluation consistent
-    across all three models in the hybrid system.
+    Returns flat splits too, so the autoencoder/RF reuse the exact
+    same underlying row split as the CNN. The evaluation units differ:
+    RF/AE operate on individual flows, while CNN operates on 100-flow
+    sequences.
     """
     df = pd.read_csv(preprocessed_csv_path)
     if 'Label' not in df.columns:

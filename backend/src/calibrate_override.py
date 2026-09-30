@@ -38,6 +38,7 @@ import tensorflow as tf
 
 sys.path.insert(0, os.path.dirname(__file__))
 from sequence_builder import build_cnn_sequences  # noqa: E402
+from scoring import attack_probability  # noqa: E402
 
 
 def _recon_threshold(models_dir):
@@ -58,10 +59,15 @@ def calibrate(csv_path, models_dir="models", ae_pct=99.5, rf_pct=99.5,
     print(f"Using reconstruction threshold {recon_threshold:.7f} from real_metrics.json")
 
     data = build_cnn_sequences(csv_path, window_size=100, stride=10)
+    # Thresholds are CHOSEN on validation benign rows and EVALUATED on the untouched
+    # test split. Picking and reporting on the same split made the recall optimistic.
+    X_val, y_val = data["X_val_flat"], data["y_val_flat"]
     X_test, y_test = data["X_test_flat"], data["y_test_flat"]
-    benign = X_test[y_test == 0]
-    attack = X_test[y_test == 1]
-    print(f"Held-out test: {len(benign)} benign, {len(attack)} attack rows")
+    benign = X_val[y_val == 0]
+    test_benign = X_test[y_test == 0]
+    attack = X_test[y_test != 0]   # every attack class, not only class 1
+    print(f"Validation (threshold selection): {len(benign)} benign rows")
+    print(f"Held-out test (evaluation): {len(test_benign)} benign, {len(attack)} attack rows")
     if len(benign) == 0:
         raise SystemExit("No benign rows in the test split — cannot calibrate.")
 
@@ -75,6 +81,8 @@ def calibrate(csv_path, models_dir="models", ae_pct=99.5, rf_pct=99.5,
     benign_ae = ae_scores(benign)
     ae_override = float(np.percentile(benign_ae, ae_pct))
     ae_recall = float((ae_scores(attack) > ae_override).mean()) if len(attack) else float("nan")
+    ae_test_fpr = float((ae_scores(test_benign) > ae_override).mean()) if len(test_benign) else float("nan")
+    print(f"  test benign false-positive rate at this threshold: {ae_test_fpr*100:.2f}%")
     print("\n[Autoencoder override]")
     print(f"  benign ae_score percentiles: "
           f"p90={np.percentile(benign_ae,90):.4f} p99={np.percentile(benign_ae,99):.4f} "
@@ -88,10 +96,13 @@ def calibrate(csv_path, models_dir="models", ae_pct=99.5, rf_pct=99.5,
     rf_path = os.path.join(models_dir, "random_forest.pkl")
     if os.path.exists(rf_path):
         rf = joblib.load(rf_path)
-        attack_idx = list(rf.classes_).index(1) if 1 in rf.classes_ else -1
-        benign_rf = rf.predict_proba(benign)[:, attack_idx]
+        benign_rf = attack_probability(rf.predict_proba(benign), rf.classes_)
         rf_override = float(np.percentile(benign_rf, rf_pct))
-        rf_recall = (float((rf.predict_proba(attack)[:, attack_idx] > rf_override).mean())
+        rf_test_fpr = (float((attack_probability(rf.predict_proba(test_benign), rf.classes_)
+                              > rf_override).mean()) if len(test_benign) else float("nan"))
+        print(f"  test benign false-positive rate at this threshold: {rf_test_fpr*100:.2f}%")
+        rf_recall = (float((attack_probability(rf.predict_proba(attack), rf.classes_)
+                            > rf_override).mean())
                      if len(attack) else float("nan"))
         print("\n[Random forest override]")
         print(f"  benign P(attack) percentiles: "
@@ -101,11 +112,17 @@ def calibrate(csv_path, models_dir="models", ae_pct=99.5, rf_pct=99.5,
               f"(self-triggers on ~{100-rf_pct:.1f}% of benign; catches "
               f"{rf_recall*100:.1f}% of attacks on the RF signal alone)")
 
+    for name, val in (("ae_override", ae_override), ("rf_override", rf_override)):
+        if val is not None and val < 0.75:
+            print(f"\nWARNING: {name}={val:.4f} is below the default alert cutoff 0.75. "
+                  "At medium sensitivity it cannot raise an alert on its own; the "
+                  "pipeline clamps anything below 0.50.")
+
     result = {
         "methodology": (
             "Override thresholds set to a high percentile of benign-only "
-            "scores on the held-out test split, so at most (100-percentile)% "
-            "of benign flows can self-trigger an override."
+            "scores on the VALIDATION split; recall and benign false-positive "
+            "rate are reported on the untouched held-out test split."
         ),
         "recon_threshold": recon_threshold,
         "ae_override": ae_override,

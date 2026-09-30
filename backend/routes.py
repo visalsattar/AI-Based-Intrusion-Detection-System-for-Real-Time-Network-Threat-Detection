@@ -1,7 +1,11 @@
 # backend/routes.py
+import hmac
 import json
 import logging
+import os
 from collections import defaultdict
+from urllib.parse import urlparse
+
 from flask import jsonify, request
 import psutil
 
@@ -21,10 +25,106 @@ DEFAULT_SETTINGS = {
     "desktopNotifications": True,
     "geolocationEnabled": True,
     "threatIntelEnabled": True,
-    "abuseIPDBKey": "b53a79c38b09ffa49c72005954d5b6f59e31a40876d62fed29eff5e94fd5efd33e03806e01b7d8ef",
+    "autoBlock": False,
     "criticalThreshold": 0.95,
     "highThreshold": 0.85,
 }
+
+
+def allowed_origins() -> list:
+    """Browser origins allowed to call the mutating API and to open the Socket.IO channel."""
+    raw = os.environ.get(
+        "IDS_ALLOWED_ORIGINS",
+        "http://localhost:5000,http://127.0.0.1:5000,http://localhost:3000,http://127.0.0.1:3000",
+    )
+    return [o.strip().rstrip("/") for o in raw.split(",") if o.strip()]
+
+
+def _num(lo, hi, cast):
+    def check(v):
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError("must be a number")
+        v = cast(v)
+        if not lo <= v <= hi:
+            raise ValueError(f"must be between {lo} and {hi}")
+        return v
+    return check
+
+
+def _flag(v):
+    if not isinstance(v, bool):
+        raise ValueError("must be true or false")
+    return v
+
+
+def _text(max_len):
+    def check(v):
+        if not isinstance(v, str) or len(v) > max_len:
+            raise ValueError(f"must be a string of at most {max_len} characters")
+        return v
+    return check
+
+
+def _enum(*allowed):
+    def check(v):
+        if v not in allowed:
+            raise ValueError(f"must be one of {', '.join(allowed)}")
+        return v
+    return check
+
+
+# Allow-list. Anything not in here is dropped instead of being written to Redis (the UI also
+# posts read-only fields such as abuseIPDBKeySet -- those are simply ignored, not rejected).
+SETTINGS_SCHEMA = {
+    "sensitivity": _enum("low", "medium", "high"),
+    "networkInterface": _text(128),
+    "flowTimeout": _num(10, 600, int),
+    "sound": _flag,
+    "desktopNotifications": _flag,
+    "geolocationEnabled": _flag,
+    "threatIntelEnabled": _flag,
+    "autoBlock": _flag,
+    "criticalThreshold": _num(0.80, 0.999, float),
+    "highThreshold": _num(0.50, 0.95, float),
+}
+
+
+def startup_auth_error(bind: str, token: str, allow_unauthenticated: bool):
+    """
+    Fail-closed check run before the server starts. Returns an error string, or None.
+
+    A non-loopback bind with no IDS_API_TOKEN would let anything that can reach the
+    port switch on firewall AutoBlock or wipe the alert history (non-browser clients
+    send no Origin header, so the Origin check does not stop them). The only way to
+    run like that is the explicit IDS_ALLOW_UNAUTHENTICATED=true opt-out, meant for a
+    container whose port is published on host loopback only.
+    """
+    import ipaddress
+    host = (bind or "").strip().strip("[]")
+    try:
+        loopback = host == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = False
+    if loopback or token or allow_unauthenticated:
+        return None
+    return (f"Refusing to start: IDS_BIND={bind!r} is not loopback and IDS_API_TOKEN is unset. "
+            "Set IDS_API_TOKEN, bind to 127.0.0.1, or (container published on host "
+            "loopback only) set IDS_ALLOW_UNAUTHENTICATED=true.")
+
+
+def validate_settings(incoming: dict):
+    """Returns (clean, errors). A blank abuseIPDBKey means 'keep the saved one'."""
+    clean, errors = {}, []
+    for key, check in SETTINGS_SCHEMA.items():
+        if key not in incoming:
+            continue
+        if key == "abuseIPDBKey" and not incoming[key]:
+            continue
+        try:
+            clean[key] = check(incoming[key])
+        except ValueError as e:
+            errors.append(f"{key}: {e}")
+    return clean, errors
 
 
 def _read_alerts_from_redis(redis_client, count=200):
@@ -51,7 +151,9 @@ def _load_settings(redis_client) -> dict:
         try:
             stored = redis_client.get('ids:settings')
             if stored:
-                settings.update(json.loads(stored))
+                saved = json.loads(stored)
+                saved.pop("abuseIPDBKey", None)  # discard legacy plaintext keys
+                settings.update(saved)
         except Exception as e:
             logger.warning(f"Could not read settings from Redis: {e}")
     return settings
@@ -66,6 +168,44 @@ def register_routes(app, redis_client=None):
     AbuseIPDB API, the real on-disk GeoIP/model status, and real OS-level
     network introspection. There is no mock/demo data path.
     """
+
+    # Migrate credentials written by older versions out of the Redis settings document.
+    if redis_client:
+        try:
+            stored = redis_client.get('ids:settings')
+            legacy = json.loads(stored) if stored else {}
+            if isinstance(legacy, dict) and legacy.pop('abuseIPDBKey', None):
+                redis_client.set('ids:settings', json.dumps(legacy))
+                logger.warning("Removed a legacy AbuseIPDB key from Redis settings; configure it in backend/.env.")
+        except Exception as e:
+            logger.warning(f"Could not clean legacy AbuseIPDB settings: {e}")
+
+    # ---------------- Guard for state-changing requests ----------------
+
+    @app.before_request
+    def _guard_mutations():
+        """
+        POST/PUT/PATCH/DELETE under /api/ can wipe the alert log, change severity thresholds and
+        switch automatic firewall blocking on, so they are guarded:
+          1. Browser requests must come from this app's own origin (or IDS_ALLOWED_ORIGINS).
+          2. If IDS_API_TOKEN is set, every mutating request needs `Authorization: Bearer <token>`.
+        Set IDS_API_TOKEN whenever the dashboard is reachable beyond loopback. Note this only
+        covers Flask's HTTP routes -- the Socket.IO connection (read-only: it streams alerts to
+        anyone who can open a websocket) is not gated by it.
+        """
+        if request.method not in ("POST", "PUT", "PATCH", "DELETE") or not request.path.startswith("/api/"):
+            return None
+        origin = request.headers.get("Origin")
+        if origin:
+            o = origin.rstrip("/")
+            if urlparse(o).netloc != request.host and o not in allowed_origins():
+                return jsonify({"status": "error", "message": "Origin not allowed"}), 403
+        token = os.environ.get("IDS_API_TOKEN")
+        if token:
+            supplied = request.headers.get("Authorization", "")
+            if not hmac.compare_digest(supplied.encode(), f"Bearer {token}".encode()):
+                return jsonify({"status": "error", "message": "Missing or invalid API token"}), 401
+        return None
 
     # ---------------- System health (real psutil metrics) ----------------
 
@@ -175,23 +315,23 @@ def register_routes(app, redis_client=None):
     def get_settings():
         settings = _load_settings(redis_client)
         # Never echo the raw API key back to the client beyond a masked preview
-        if settings.get('abuseIPDBKey'):
-            settings['abuseIPDBKeySet'] = True
-            settings['abuseIPDBKey'] = ''
-        else:
-            settings['abuseIPDBKeySet'] = False
+        settings['abuseIPDBKeySet'] = bool(os.environ.get('ABUSEIPDB_API_KEY'))
+        settings.pop('abuseIPDBKey', None)
         return jsonify(settings)
 
     @app.route('/api/save-settings', methods=['POST'])
     def save_settings():
-        incoming = request.json or {}
+        incoming = request.get_json(silent=True)
+        if not isinstance(incoming, dict):
+            return jsonify({'status': 'error', 'message': 'Expected a JSON object'}), 400
+
+        clean, errors = validate_settings(incoming)
         current = _load_settings(redis_client)
-
-        # Don't overwrite a previously-saved key with a blank field submission
-        if not incoming.get('abuseIPDBKey'):
-            incoming.pop('abuseIPDBKey', None)
-
-        current.update(incoming)
+        current.update(clean)
+        if current['highThreshold'] >= current['criticalThreshold']:
+            errors.append("highThreshold: must be lower than criticalThreshold")
+        if errors:
+            return jsonify({'status': 'error', 'message': 'Invalid settings', 'errors': errors}), 400
         if redis_client:
             try:
                 redis_client.set('ids:settings', json.dumps(current))

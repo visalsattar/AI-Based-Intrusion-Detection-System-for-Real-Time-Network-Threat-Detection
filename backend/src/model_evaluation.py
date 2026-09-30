@@ -98,12 +98,15 @@ def run_full_evaluation(preprocessed_csv_path: str,
 
     results = {
         'methodology': (
-            'All metrics computed on a held-out test set none of the '
-            'models saw during training or threshold selection. '
-            'Autoencoder threshold derived from benign training '
-            'reconstruction error only.'
+            'Autoencoder and Random Forest are evaluated on the held-out '
+            'flow-level test set. CNN is evaluated on 100-flow sequences '
+            'constructed from that held-out test split. '
+            'Autoencoder threshold is derived from benign training data only.'
         ),
-        'test_set_size': int(len(y_test)),
+        'flow_level_test_set_size': int(len(y_test)),
+        'cnn_sequence_test_set_size': int(len(y_seq_test)),
+        'cnn_window_size': 100,
+        'cnn_stride': 10,
     }
 
     ae_path = os.path.join(models_dir, 'autoencoder.h5')

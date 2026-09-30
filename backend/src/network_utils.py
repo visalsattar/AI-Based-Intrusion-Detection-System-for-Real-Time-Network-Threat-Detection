@@ -67,6 +67,18 @@ _ARP_LINE_WINDOWS = re.compile(
 )
 
 
+def _is_unicast_mac(mac: str) -> bool:
+    """True for a valid nonzero unicast MAC address."""
+    parts = (mac or "").replace("-", ":").lower().split(":")
+    if len(parts) != 6 or any(len(part) != 2 for part in parts):
+        return False
+    try:
+        octets = [int(part, 16) for part in parts]
+    except ValueError:
+        return False
+    return any(octets) and (octets[0] & 1) == 0
+
+
 def _read_proc_net_arp() -> list[dict]:
     """Linux: /proc/net/arp is always readable, no subprocess/root needed."""
     devices = []
@@ -78,8 +90,8 @@ def _read_proc_net_arp() -> list[dict]:
             if len(parts) < 6:
                 continue
             ip, _hw_type, flags, mac, _mask, iface = parts[:6]
-            if mac == "00:00:00:00:00:00":
-                continue  # incomplete ARP entry, device not actually resolved
+            if not _is_unicast_mac(mac):
+                continue  # incomplete, multicast, or broadcast ARP entry
             devices.append({
                 "ip": ip, "mac": mac, "interface": iface,
                 "status": "online" if flags != "0x0" else "stale",
@@ -111,7 +123,7 @@ def _read_arp_command() -> list[dict]:
             continue
         groups = match.groupdict()
         mac = groups.get("mac", "").lower()
-        if not mac or mac == "ff-ff-ff-ff-ff-ff" or mac == "ff:ff:ff:ff:ff:ff":
+        if not _is_unicast_mac(mac):
             continue
         devices.append({
             "ip": groups.get("ip"), "mac": mac,

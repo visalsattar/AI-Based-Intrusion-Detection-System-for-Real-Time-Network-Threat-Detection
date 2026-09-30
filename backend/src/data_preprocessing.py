@@ -1,13 +1,16 @@
 # backend/src/data_preprocessing.py
+import os
 import pandas as pd
 import numpy as np
 import logging
+import joblib
 from sklearn.preprocessing import MinMaxScaler, LabelEncoder
 from sklearn.impute import SimpleImputer
-import warnings
-warnings.filterwarnings('ignore')
 
-logging.basicConfig(level=logging.INFO)
+# No logging.basicConfig() and no global warnings filter here. Both ran at import time in every
+# process that imported this module (main.py included): basicConfig pre-empted main.py's own
+# logging setup (logs/ids.log was never written) and the blanket filter hid every sklearn/TF
+# warning in the whole process -- including "X does not have valid feature names".
 logger = logging.getLogger(__name__)
 
 class CICIDSPreprocessor:
@@ -18,21 +21,15 @@ class CICIDSPreprocessor:
         BENIGN → 0, every attack type → 1.
         All existing trained models expect this encoding.
 
-    Multi-class mode (--multiclass flag in main.py):
+    Multi-class mode (preprocess_pipeline(multiclass=True); NOT wired into main.py):
         BENIGN → 0, each distinct attack label → a unique integer in
         alphabetical order (e.g. Bot→1, DDoS→2, DoS Hulk→3 ...).
-        A models/label_map.json is written alongside the preprocessed CSV
-        so the live pipeline can translate integer predictions back to
-        human-readable names ("DDoS", "Port Scan", etc.) in dashboard alerts.
-        To activate, retrain with `python main.py --mode train --multiclass`.
+        A models/label_map.json is written so the live pipeline can translate
+        integer predictions back to names. Training (ai_model_development) copes
+        with >2 classes, but model_evaluation.py is binary-only, so a multi-class
+        run cannot be evaluated yet. The shipped models are binary.
     """
 
-    CICIDS_FEATURE_COLS = [
-        'Dst Port', 'Protocol', 'Timestamp', 'Flow Duration',
-        'Total Fwd Packets', 'Total Backward Packets', 
-        # ... (full list from previous code)
-    ]
-    
     def __init__(self, dataset_name: str = 'CICIDS2017'):
         self.dataset_name = dataset_name
         self.scaler = MinMaxScaler()
@@ -147,9 +144,32 @@ class CICIDSPreprocessor:
         
         return df
     
+    def save_scaler(self, path: str, overwrite: bool = False) -> str:
+        """
+        Persist the fitted MinMaxScaler -- the artifact the live sensor loads as
+        models/feature_scaler.pkl. It was never written by this class, so the documented
+        'train from scratch' route could not reproduce the deployed artifacts.
+
+        Never overwrites an existing scaler unless asked: the autoencoder and RF were fitted
+        against THAT scaler, and swapping it silently invalidates them. If one exists, the new
+        one is written next to it as <name>.new.pkl.
+        """
+        if os.path.exists(path) and not overwrite:
+            root, ext = os.path.splitext(path)
+            alt = f"{root}.new{ext}"
+            logger.warning(f"{path} already exists and models were trained against it; "
+                           f"writing the new scaler to {alt} instead (pass overwrite_scaler=True to replace).")
+            path = alt
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        joblib.dump(self.scaler, path)
+        logger.info(f"Saved fitted scaler ({len(self.scaler.feature_names_in_)} features) to {path}")
+        return path
+
     def preprocess_pipeline(self, file_path: str, output_path: str = None,
                              multiclass: bool = False,
-                             label_map_path: str = None) -> pd.DataFrame:
+                             label_map_path: str = None,
+                             scaler_path: str = None,
+                             overwrite_scaler: bool = False) -> pd.DataFrame:
         """
         Full preprocessing pipeline.
 
@@ -160,8 +180,9 @@ class CICIDSPreprocessor:
                     and a label_map.json is written so the live pipeline can
                     name attack types in dashboard alerts.
         label_map_path: where to write label_map.json in multiclass mode.
-                    Defaults to models/label_map.json relative to the
-                    preprocessed CSV, so main.py training flow auto-finds it.
+                    Defaults to <backend>/models/label_map.json, derived from
+                    output_path == <backend>/data/preprocessed/<file>.csv.
+        scaler_path: if given, the fitted MinMaxScaler is saved there (see save_scaler).
         """
         logger.info("\n" + "="*70)
         logger.info(f"STARTING PREPROCESSING PIPELINE (multiclass={multiclass})")
@@ -203,7 +224,13 @@ class CICIDSPreprocessor:
         df = df.select_dtypes(exclude=['object'])
 
         df = self.normalize_features(df, fit=True)
-        df = self.encode_labels(df, fit=True)
+        # Labels are already the integers we want. They used to be pushed through a
+        # LabelEncoder here, which sorts them as STRINGS ('0','1','10','2',...): with the 14
+        # CICIDS2017 attack classes 13 of 15 labels ended up with a different integer than
+        # label_map.json promised. (Harmless for the binary 0/1 case, which is why it survived.)
+
+        if scaler_path:
+            self.save_scaler(scaler_path, overwrite=overwrite_scaler)
 
         if output_path:
             df.to_csv(output_path, index=False)
@@ -212,12 +239,15 @@ class CICIDSPreprocessor:
         # Write label_map.json in multi-class mode so the pipeline can
         # translate RF integer predictions to named attack types at runtime.
         if multiclass and label_map is not None:
-            import json, os
+            import json
             if label_map_path is None:
-                base = os.path.dirname(output_path) if output_path else '.'
-                label_map_path = os.path.join(
-                    os.path.dirname(base), 'models', 'label_map.json'
-                )
+                # <backend>/data/preprocessed/x.csv -> <backend>/models/label_map.json
+                # (the old code went up only ONE level and wrote <backend>/data/models/...)
+                if output_path:
+                    backend_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(output_path))))
+                else:
+                    backend_root = os.getcwd()
+                label_map_path = os.path.join(backend_root, 'models', 'label_map.json')
             os.makedirs(os.path.dirname(label_map_path) or '.', exist_ok=True)
             # JSON keys must be strings; store as {"0":"Benign","1":"DDoS",...}
             with open(label_map_path, 'w') as f:
