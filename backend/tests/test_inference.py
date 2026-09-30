@@ -61,8 +61,11 @@ def pipeline():
     return ids
 
 @pytest.fixture(autouse=True)
-def _reset_alert_cooldown(pipeline):
+def _isolate_pipeline(pipeline, monkeypatch):
+    """Pin every on-disk input the alert path reads, so results don't depend on local files."""
     pipeline._last_alert.clear()
+    monkeypatch.setattr(pipeline, "recon_threshold", 0.01)   # ae_score(1.0) = 0.99
+    monkeypatch.setattr(pipeline, "_load_settings", lambda: {"sensitivity": "medium", "autoBlock": False})
 
 
 def _make_flow(pipeline, src="10.0.0.5", dst="10.0.0.9", sport=44444, dport=80, n=4):
