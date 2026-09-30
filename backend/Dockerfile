@@ -1,6 +1,6 @@
 # backend/Dockerfile
 
-# ---------- Stage 1: build the React frontend ----------
+# ---------- Stage 1: Build the React frontend ----------
 FROM node:20-slim AS frontend-builder
 
 # Match the npm version that generated package-lock.json (the base image's

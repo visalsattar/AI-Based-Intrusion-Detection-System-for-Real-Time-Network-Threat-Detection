@@ -1,66 +1,245 @@
 # backend/src/ids_pipeline.py
-import asyncio
 import logging
 import os
+import platform
+import queue
 from datetime import datetime
-from typing import Dict, Tuple
+from typing import NamedTuple, Tuple
 import numpy as np
 from scapy.all import sniff, IP, TCP, UDP
-from redis import Redis
 import subprocess
 import json
 import time
+import ipaddress
+import threading
+import heapq
+import pandas as pd
 
-# Setting up logging for real-time monitoring[cite: 4]
-logging.basicConfig(level=logging.INFO)
+from redis_util import make_redis
+from threat_evidence import save_threat_evidence
+from scoring import attack_probability, clamp_override, sanitize_settings
+
+# NOTE: no logging.basicConfig() here. A basicConfig at import time runs before main.py's own
+# setup and turns that one into a silent no-op (logs/ids.log was never written). Logging is
+# configured exactly once, in main.py.
 logger = logging.getLogger(__name__)
 
-import platform
 
-def block_ip(ip):
+def _load_whitelist(config_path=None) -> set:
+    """Combine IDS_WHITELIST with a local JSON whitelist; validate every address."""
+    values = {x.strip() for x in os.environ.get("IDS_WHITELIST", "").split(",") if x.strip()}
+    path = config_path or os.path.join(os.path.dirname(__file__), "..", "config", "whitelist.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            values.update(str(x).strip() for x in json.load(f).get("whitelist", []) if str(x).strip())
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning(f"Could not load whitelist {path}: {e}")
+    valid = set()
+    for value in values:
+        try:
+            valid.add(str(ipaddress.ip_address(value)))
+        except ValueError:
+            logger.warning(f"Ignoring invalid whitelist IP: {value!r}")
+    return valid
+
+
+def _local_ips() -> set:
+    """IPv4 addresses on this host's interfaces (tells inbound from outbound flows)."""
+    try:
+        import psutil
+        return {a.address for addrs in psutil.net_if_addrs().values()
+                for a in addrs if a.family.name == "AF_INET"}
+    except Exception:
+        return set()
+
+
+def _fw(cmd):
+    return subprocess.run(cmd, capture_output=True, timeout=10)
+
+
+IDS_IPTABLES_COMMENT = "IDS-AUTOBLOCK"
+
+
+def block_ip(ip) -> bool:
     """
-    Automated IPS functionality to block malicious IPs at the OS level.
-    Uses iptables on Linux (the real deploy target — see backend/Dockerfile,
-    which is python:3.11-slim) and falls back to the Windows Firewall command
-    when running directly on Windows during local development/demos.
+    Install an IDS-owned inbound DROP rule for a public IP.
+
+    IMPORTANT: only rules explicitly tagged as IDS-owned are ever removed later.
+    A pre-existing generic DROP rule is treated as operator-owned and is never
+    deleted by the IDS.
     """
+    try:
+        ip = str(ipaddress.ip_address(ip))
+        if not ipaddress.ip_address(ip).is_global:
+            logger.warning(f"[IPS] Refusing to block non-public address {ip}")
+            return False
+    except ValueError:
+        return False
+
     system = platform.system().lower()
     try:
         if system == "linux":
-            # -C (check) first so re-running doesn't pile up duplicate rules
-            check = subprocess.run(
-                ["iptables", "-C", "INPUT", "-s", ip, "-j", "DROP"],
-                capture_output=True
-            )
-            if check.returncode != 0:
-                subprocess.run(["iptables", "-A", "INPUT", "-s", ip, "-j", "DROP"], check=True)
-            logger.warning(f"!!! [IPS] Blocked malicious IP via iptables: {ip}")
-        elif system == "windows":
-            rule_name = f"Block_IDS_{ip}"
-            cmd = (f'netsh advfirewall firewall add rule name="{rule_name}" '
-                   f'dir=in action=block remoteip={ip}')
-            os.system(cmd)
-            logger.warning(f"!!! [IPS] Blocked malicious IP via Windows Firewall: {ip}")
-        else:
-            logger.warning(f"[IPS] Automatic blocking not implemented for platform '{system}' — "
-                            f"IP {ip} was flagged CRITICAL but NOT blocked.")
-    except subprocess.CalledProcessError as e:
-        logger.error(f"[IPS] Failed to block {ip} (likely missing NET_ADMIN capability "
-                      f"in this container — add --cap-add=NET_ADMIN): {e}")
+            tagged = ["iptables", "-C", "INPUT", "-s", ip, "-m", "comment",
+                      "--comment", IDS_IPTABLES_COMMENT, "-j", "DROP"]
+            if _fw(tagged).returncode == 0:
+                return True  # Already owned by this IDS.
+
+            generic = _fw(["iptables", "-C", "INPUT", "-s", ip, "-j", "DROP"])
+            if generic.returncode == 0:
+                logger.warning(
+                    f"[IPS] {ip} is already blocked by an unowned firewall rule; "
+                    "leaving it untouched."
+                )
+                return False
+
+            # Insert at the front so an earlier ACCEPT rule cannot shadow the DROP.
+            add = _fw(["iptables", "-I", "INPUT", "1", "-s", ip, "-m", "comment",
+                       "--comment", IDS_IPTABLES_COMMENT, "-j", "DROP"])
+            if add.returncode != 0:
+                raise RuntimeError(add.stderr.decode(errors="replace").strip())
+            logger.warning(f"!!! [IPS] Blocked malicious IP via IDS-owned iptables rule: {ip}")
+            return True
+
+        if system == "windows":
+            name = f"Block_IDS_{ip}"
+            show = _fw(["netsh", "advfirewall", "firewall", "show", "rule", f"name={name}"])
+            if show.returncode == 0:
+                return True  # The deterministic IDS rule already exists.
+            add = _fw(["netsh", "advfirewall", "firewall", "add", "rule",
+                       f"name={name}", "dir=in", "action=block", f"remoteip={ip}"])
+            if add.returncode != 0:
+                raise RuntimeError(add.stdout.decode(errors="replace").strip())
+            logger.warning(f"!!! [IPS] Blocked malicious IP via IDS-owned Windows Firewall rule: {ip}")
+            return True
+
+        logger.warning(f"[IPS] Automatic blocking not implemented for platform '{system}' — "
+                       f"IP {ip} was flagged CRITICAL but NOT blocked.")
     except Exception as e:
-        logger.error(f"[IPS] Unexpected error blocking {ip}: {e}")
-    
+        logger.error(f"[IPS] Failed to block {ip} (missing NET_ADMIN / not root / not host "
+                     f"network namespace?): {e}")
+    return False
+
+
+def unblock_ip(ip) -> None:
+    """Remove only the IDS-owned firewall rule for ``ip``."""
+    try:
+        ip = str(ipaddress.ip_address(ip))
+        system = platform.system().lower()
+        if system == "linux":
+            _fw(["iptables", "-D", "INPUT", "-s", ip, "-m", "comment",
+                 "--comment", IDS_IPTABLES_COMMENT, "-j", "DROP"])
+        elif system == "windows":
+            _fw(["netsh", "advfirewall", "firewall", "delete", "rule",
+                 f"name=Block_IDS_{ip}"])
+        logger.warning(f"[IPS] Unblocked IDS-owned rule for {ip}")
+    except Exception as e:
+        logger.error(f"[IPS] Failed to unblock {ip}: {e}")
+
+
+def _payload_len(p) -> int:
+    """
+    L4 payload bytes of one packet -- the quantity CICFlowMeter uses for every *Length* and
+    *Bytes* feature (BasicFlow.addPacket feeds getPayloadBytes() into flowLengthStats,
+    fwdPktStats, bwdPktStats and forwardBytes; headers are tracked separately).
+
+    len(p) is NOT that. On an Ethernet capture it also counts the 14-byte Ethernet header plus
+    the IP and TCP/UDP headers, so a bare SYN measures 54 bytes live where CICIDS records 0.
+    Ethernet minimum-frame padding (Scapy exposes it inside the TCP payload) is ignored too.
+    """
+    ip = p[IP]
+    total = ip.len or len(ip)
+    ihl = (ip.ihl or 5) * 4
+    if TCP in p:
+        l4 = (p[TCP].dataofs or 5) * 4
+    elif UDP in p:
+        l4 = 8
+    else:
+        return 0
+    return max(int(total) - ihl - l4, 0)
+
+
+class PacketSummary(NamedTuple):
+    """Everything the feature extractor reads from one packet. Replaces retained Scapy objects."""
+    ts: float        # capture timestamp, seconds
+    fwd: bool        # direction relative to the flow initiator
+    plen: int        # L4 payload bytes (CICFlowMeter semantics, see _payload_len)
+    hlen: int        # L4 header bytes
+    flags: int       # raw TCP flags byte; 0 for UDP
+    is_tcp: bool
+
+
+# TCP flag bits as CICFlowMeter counts them.
+_FLAG_BITS = dict(fin=0x01, syn=0x02, rst=0x04, psh=0x08, ack=0x10, urg=0x20, ece=0x40, cwe=0x80)
+
+
+def summarize(packet):
+    """
+    The single Scapy -> plain-data boundary. Returns None for anything that is not
+    IPv4 TCP/UDP, otherwise:
+        ((src, sport, dst, dport, proto), wire_len, window, seq, ack,
+         (ts, payload_len, header_len, flags, is_tcp))
+    Direction is resolved at ingest, once the flow exists. seq/ack are consumed there
+    for handshake verification and never stored.
+    """
+    if IP not in packet:
+        return None
+    ip = packet[IP]
+    if TCP in packet:
+        t = packet[TCP]
+        sport, dport, is_tcp = int(t.sport), int(t.dport), True
+        flags, win, seq, ack = int(t.flags), int(t.window), int(t.seq), int(t.ack)
+        hlen = (t.dataofs or 5) * 4
+    elif UDP in packet:
+        u = packet[UDP]
+        sport, dport, is_tcp = int(u.sport), int(u.dport), False
+        flags, win, seq, ack, hlen = 0, None, 0, 0, 8
+    else:
+        return None
+    return ((ip.src, sport, ip.dst, dport, int(ip.proto)), len(packet), win, seq, ack,
+            (float(packet.time), _payload_len(packet), hlen, flags, is_tcp))
+
+
+def _as_summary(entry, flow) -> PacketSummary:
+    """
+    Accept a PacketSummary, or a legacy (scapy_packet, is_forward) tuple built by
+    older tests/fixtures. Legacy entries go through the same summarize() boundary,
+    so reference-fixture tests exercise the production feature path.
+    """
+    if isinstance(entry, PacketSummary):
+        return entry
+    packet, is_fwd = entry
+    s = summarize(packet)
+    if s is None:
+        raise ValueError("packet_list entry is not IPv4 TCP/UDP")
+    ts, plen, hlen, fl, is_tcp = s[5]
+    return PacketSummary(ts, bool(is_fwd), plen, hlen, fl, is_tcp)
+
+
 class RealTimeIDSPipeline:
     """
-    Orchestrates real-time packet capture → feature extraction → AI inference → alerting[cite: 4].
+    Orchestrates real-time packet capture → feature extraction → AI inference → alerting.
+
+    Threading model:
+      * capture thread (Scapy sniff callback): summarize packet, enqueue. Nothing else.
+      * scoring worker: owns flow state, batching, inference, alerting, firewall calls.
+      * ticker: health reporting only.
+    When self._queue is None (tests, offline replay) packets are processed synchronously.
     """
 
     # Confidence-override fusion thresholds (see _process_prediction). A single
     # model this confident overrides the 0.5/0.5 average so neither detector can
-    # fully veto the other: the AE can still raise novel attacks the RF misses,
-    # and the RF can still confirm known attacks the AE reconstructs well.
+    # fully veto the other.
     AE_OVERRIDE_CONF = 0.97   # autoencoder alone -> possible novel/unknown attack
     RF_OVERRIDE_CONF = 0.90   # random forest alone -> high-confidence known attack
+    MAX_ACTIVE_BLOCKS = 256   # bound iptables rule growth under a spoofed flood
+
+    # CICFlowMeter V4 uses a 1-second activity/bulk/subflow boundary. Separate from
+    # the IDS flow timeout (an operational eviction bound, not a feature definition).
+    CICFLOWMETER_ACTIVITY_TIMEOUT_US = 1_000_000
+
+    UNSUPPORTED_LIVE_FEATURES = ()
 
     def __init__(self,
                  model_path: str,
@@ -68,46 +247,49 @@ class RealTimeIDSPipeline:
                  alert_threshold: float = 0.75,
                  packet_batch_size: int = 100,
                  flow_idle_timeout: float = 120.0,
-                 max_tracked_flows: int = 20000):
+                 max_tracked_flows: int = 20000,
+                 flow_max_duration: float = 120.0,
+                 max_packets_per_flow: int = 2000,
+                 batch_interval: float = 2.0,
+                 alert_cooldown: float = 60.0,
+                 block_ttl: float = 900.0,
+                 sweep_interval: float = 1.0):
         self.model_path = model_path
         self.alert_threshold = alert_threshold
         self.packet_batch_size = packet_batch_size
-        # Flow-table eviction bounds. Without these, flow_tracker grows for
-        # the lifetime of the capture (a real memory leak on a long-running
-        # sensor) and stale flows keep re-scoring with ever-growing stats.
-        #   - flow_idle_timeout: seconds since last packet before a flow is
-        #     considered finished and dropped.
-        #   - max_tracked_flows: hard cap; if exceeded, the oldest (by
-        #     last_seen) flows are evicted first — a safety net against
-        #     high-cardinality floods (e.g. spoofed-source DDoS/port scans)
-        #     that create huge numbers of one-packet flows.
+        # Flow-table eviction bounds:
+        #   - flow_idle_timeout: seconds since last packet before a flow is finished.
+        #   - max_tracked_flows: hard cap; oldest flows are scored then evicted
+        #     (safety net against high-cardinality floods).
         self.flow_idle_timeout = flow_idle_timeout
+        self.flow_max_duration = flow_max_duration
+        self.max_packets_per_flow = max_packets_per_flow
+        self.batch_interval = batch_interval
+        self.alert_cooldown = alert_cooldown
+        self.block_ttl = block_ttl
+        self.sweep_interval = sweep_interval
+        self._last_batch_at = time.time()
+        self._capture_health_at = time.monotonic()
+        self._capture_packets = 0
+        self._capture_ipv4_transport_packets = 0
         self.max_tracked_flows = max_tracked_flows
         self._last_eviction_at = 0.0
-        
+
         try:
-            # Redis connection logic for alert persistence[cite: 4]
-            redis_host = os.environ.get('REDIS_HOST', 'redis')
-            self.redis_client = Redis(host=redis_host, port=6379, decode_responses=True)
+            self.redis_client = make_redis()
             self.redis_client.ping()
-            logger.info(f"Redis connected successfully (host={redis_host})")
+            logger.info("Redis connected successfully")
         except Exception as e:
             logger.warning(f"Redis connection failed: {e}. Alerts won't be persisted.")
             self.redis_client = None
-        
+
         try:
-            # Load the trained models. Live detection is a real two-model
-            # ensemble of complementary detectors:
-            #   - Autoencoder (unsupervised): reconstruction error flags traffic
-            #     unlike anything seen in benign training — catches UNKNOWN attacks.
-            #   - Random Forest (supervised, binary benign/attack): high-precision
-            #     recogniser of attack patterns it was trained on (F1 ~0.99).
-            # The CNN is intentionally NOT loaded here: it classifies over
-            # sequences of 100 consecutive flows (see sequence_builder.py), which
-            # only has meaning on the row-ordered CICIDS2017 CSV. Live per-flow
-            # capture provides no equivalent temporal window, so running the CNN
-            # live would feed it out-of-distribution input. It remains an offline
-            # evaluation model (see model_evaluation.py), documented as such.
+            # Live detection is a two-model ensemble:
+            #   - Autoencoder (unsupervised): reconstruction error vs benign training.
+            #   - Random Forest (supervised): known attack patterns.
+            # The CNN is intentionally NOT loaded: it classifies sequences of 100
+            # consecutive CSV rows (sequence_builder.py), which has no live equivalent.
+            # It is an offline comparison model only (model_evaluation.py).
             import tensorflow as tf
             from joblib import load
 
@@ -118,10 +300,8 @@ class RealTimeIDSPipeline:
             logger.error(f"Failed to load models: {e}")
             raise
 
-        # Supervised second opinion. Optional by design: if the RF can't be
-        # loaded (missing file, or a scikit-learn version skew that breaks the
-        # pickle), live detection degrades gracefully to autoencoder-only
-        # rather than crashing the whole capture pipeline.
+        # Supervised second opinion. Optional: if it can't load, AE-only mode
+        # (which is itself gated by IDS_AE_ONLY_ALERTING_VALIDATED).
         self.random_forest = None
         self._rf_attack_idx = None
         self._rf_multiclass = False
@@ -130,21 +310,18 @@ class RealTimeIDSPipeline:
             rf_path = os.path.join(os.path.dirname(model_path), 'random_forest.pkl')
             self.random_forest = load(rf_path)
             classes = list(self.random_forest.classes_)
+            if 0 not in classes:
+                raise ValueError(f"RF has no benign class 0 (classes={classes}); "
+                                 "P(attack) = 1 - P(benign) cannot be computed")
             self._rf_attack_idx = classes.index(1) if 1 in classes else len(classes) - 1
-            # Multi-class RF (retrained with --multiclass) has more than the
-            # binary [0, 1] class set. When present it can name the attack type
-            # (DDoS, Port Scan, etc.) rather than just "attack" — loaded from
-            # label_map.json written by preprocess_pipeline(multiclass=True).
             self._rf_multiclass = len(classes) > 2
             mode = "multi-class" if self._rf_multiclass else "binary"
             logger.info(f"Random Forest loaded ({mode}, classes={classes}) — supervised cross-check enabled")
         except Exception as e:
+            self.random_forest = None
             logger.warning(f"Random Forest not loaded ({e}); live detection will use the autoencoder alone")
 
-        # Attack-type label map: {"0":"Benign","1":"DDoS","2":"Port Scan",...}
-        # Written by data_preprocessing.preprocess_pipeline(multiclass=True).
-        # When absent (binary RF or no retraining yet) falls back to a generic
-        # label so the pipeline runs identically to the previous binary mode.
+        # Attack-type label map written by preprocess_pipeline(multiclass=True).
         self._label_map = {}
         label_map_path = os.path.join(os.path.dirname(model_path), 'label_map.json')
         try:
@@ -155,40 +332,60 @@ class RealTimeIDSPipeline:
         except FileNotFoundError:
             if self._rf_multiclass:
                 logger.warning(f"Multi-class RF loaded but no label_map.json at {label_map_path}; "
-                                "threat names will fall back to class integers. Re-run preprocessing "
-                                "with --multiclass to regenerate the map.")
+                               "threat names will fall back to class integers. Re-run preprocessing "
+                               "with --multiclass to regenerate the map.")
         except Exception as e:
             logger.warning(f"Could not load label map ({e}); threat names will be generic")
 
-        # The autoencoder's raw output is a *reconstructed feature vector*,
-        # not a scalar score — "anomalous" means "poorly reconstructed", so
-        # the real signal is reconstruction error (MSE between input and
-        # output), benchmarked against a threshold calibrated on real benign
-        # data (see model_evaluation.py::evaluate_autoencoder, which writes
-        # this value to models/real_metrics.json). Without that calibration
-        # file, detection still runs but with an explicitly uncalibrated
-        # fallback — logged loudly rather than silently guessed.
         self.recon_threshold, self._threshold_calibrated = self._load_recon_threshold(model_path)
-
-        # Override thresholds: use benign-calibrated values when
-        # `python src/calibrate_override.py` has produced
-        # models/override_calibration.json, otherwise fall back to the coded
-        # class defaults (AE_OVERRIDE_CONF / RF_OVERRIDE_CONF). Set as instance
-        # attributes so they shadow the class defaults when present.
         self.AE_OVERRIDE_CONF, self.RF_OVERRIDE_CONF = self._load_override_confs(model_path)
+
+        # AE-only detection is intentionally opt-in (requires live-lab validation).
+        self.ae_only_alerting_validated = (
+            os.environ.get("IDS_AE_ONLY_ALERTING_VALIDATED", "false").strip().lower()
+            in {"1", "true", "yes"}
+        )
+        if self.random_forest is None and not self.ae_only_alerting_validated:
+            logger.warning(
+                "AE-only alerting is disabled until IDS_AE_ONLY_ALERTING_VALIDATED=true. "
+                "Capture and validate controlled live-lab traffic first."
+            )
+        self._ae_only_suppressed = 0   # counted, logged once, not per flow
+        self.evidence_origin = os.environ.get("IDS_EVIDENCE_ORIGIN", "live_unclassified")
 
         self.packet_buffer = []
         self.flow_tracker = {}
-        self._settings_cache = {}
+        self._settings_cache = sanitize_settings({})
         self._settings_loaded_at = 0.0
+        self.evicted_flows_total = 0
+        self._last_alert = {}          # (src_ip, severity) -> (last_alert_ts, suppressed_count)
+        self._lock = threading.RLock() # worker and flush()/tests share flow state
+        self._capture_counter_lock = threading.Lock()
+        self._done = set()             # flow keys flagged finished (FIN/RST/packet cap)
+        self._last_sweep_at = 0.0
+        self._blocked = {}             # ip -> unblock-at epoch
+        self._autoblock_state_path = os.environ.get(
+            "IDS_AUTOBLOCK_STATE",
+            os.path.join(os.path.dirname(__file__), "..", "evidence", "autoblock_state.json"),
+        )
+        self._load_autoblock_state()
+        self._local_ips = _local_ips()
+        self._local_ips_at = time.time()
+        self._whitelist = _load_whitelist()
+        self._stop = threading.Event()
+        # IDS_DUMP_FEATURES=<file.csv>: append every scored flow's raw features. Off by default.
+        self._dump_path = os.environ.get("IDS_DUMP_FEATURES") or None
+        self._dump_rows = 0
+        self._dump_max = int(os.environ.get("IDS_DUMP_MAX_ROWS", "200000"))
+        # Capture -> worker handoff. Bounded: on overflow packets are dropped and
+        # counted (reported in CAPTURE_HEALTH), never silently lost.
+        self._queue = queue.Queue(maxsize=int(os.environ.get("IDS_QUEUE_MAX", "50000")))
+        self._dropped_packets = 0
+        self._worker_thread = None
 
     @staticmethod
     def _load_recon_threshold(model_path: str):
-        """
-        Reads the real benign-data-derived reconstruction-error threshold
-        produced by `python src/model_evaluation.py <preprocessed_csv>`.
-        Returns (threshold, is_calibrated).
-        """
+        """Reads the benign-calibrated reconstruction threshold. Returns (threshold, is_calibrated)."""
         metrics_path = os.path.join(os.path.dirname(model_path), 'real_metrics.json')
         try:
             with open(metrics_path) as f:
@@ -196,7 +393,7 @@ class RealTimeIDSPipeline:
             threshold = metrics.get('autoencoder', {}).get('threshold')
             if threshold:
                 logger.info(f"Loaded calibrated reconstruction-error threshold: {threshold:.6f} "
-                             f"(from {metrics_path})")
+                            f"(from {metrics_path})")
                 return float(threshold), True
         except FileNotFoundError:
             pass
@@ -207,76 +404,52 @@ class RealTimeIDSPipeline:
         logger.warning(
             f"No calibrated reconstruction-error threshold found at {metrics_path}. "
             f"Using an UNCALIBRATED fallback ({fallback}) — severity scores will be "
-            f"meaningless until you run `python src/model_evaluation.py <preprocessed_csv>` "
-            f"to generate real_metrics.json from your real training data."
+            f"meaningless until you run `python src/model_evaluation.py <preprocessed_csv>`."
         )
         return fallback, False
 
     @classmethod
     def _load_override_confs(cls, model_path: str):
         """
-        Reads benign-calibrated override thresholds produced by
-        `python src/calibrate_override.py`, from models/override_calibration.json.
-        Returns (ae_override, rf_override). Falls back to the class defaults
-        (AE_OVERRIDE_CONF / RF_OVERRIDE_CONF) when the file is absent or a value
-        is missing — so the system runs with sensible defaults out of the box
-        and simply tightens up once real calibration is available.
+        Reads override thresholds from models/override_calibration.json, falling back
+        to the class defaults. Values below scoring.OVERRIDE_FLOOR are clamped.
         """
         ae, rf = cls.AE_OVERRIDE_CONF, cls.RF_OVERRIDE_CONF
         path = os.path.join(os.path.dirname(model_path), 'override_calibration.json')
         try:
             with open(path) as f:
                 cal = json.load(f)
+            new_ae, new_rf = ae, rf
             if cal.get('ae_override') is not None:
-                ae = float(cal['ae_override'])
+                new_ae = clamp_override(cal['ae_override'])
             if cal.get('rf_override') is not None:
-                rf = float(cal['rf_override'])
-            logger.info(f"Loaded benign-calibrated override thresholds "
+                new_rf = clamp_override(cal['rf_override'])
+            ae, rf = new_ae, new_rf
+            logger.info(f"Loaded override thresholds (effective, post-clamp) "
                         f"(ae={ae:.4f}, rf={rf:.4f}) from {path}")
         except FileNotFoundError:
             logger.info(f"No override_calibration.json — using coded override "
-                        f"defaults (ae={ae:.2f}, rf={rf:.2f}). Run "
-                        f"src/calibrate_override.py to derive them from benign data.")
+                        f"defaults (ae={ae:.2f}, rf={rf:.2f}).")
         except Exception as e:
             logger.warning(f"Could not parse {path}: {e}; using coded override defaults")
         return ae, rf
 
     def _load_settings(self) -> dict:
-        """
-        Re-reads the Settings page's saved config (POST /api/save-settings)
-        from Redis at most once every 5 seconds, so adjusting the Critical/
-        High thresholds or the Automatic IP Blocking toggle in the UI takes
-        effect on the next batch of packets without restarting capture.
-        """
+        """Re-read sanitized Settings-page config from Redis at most every 5 s."""
         now = time.time()
         if self.redis_client and (now - self._settings_loaded_at) > 5:
             try:
                 stored = self.redis_client.get('ids:settings')
                 if stored:
-                    self._settings_cache = json.loads(stored)
+                    self._settings_cache = sanitize_settings(json.loads(stored))
             except Exception as e:
                 logger.debug(f"Could not refresh live settings: {e}")
             self._settings_loaded_at = now
         return self._settings_cache
 
     def _evict_stale_flows(self):
-        """
-        Drop finished/stale flows so flow_tracker stays bounded.
-
-        Two independent bounds (see __init__):
-          1. Idle timeout — any flow whose last packet is older than
-             flow_idle_timeout is removed. This is the normal path: short-lived
-             connections finish and age out.
-          2. Hard cap — if the table still exceeds max_tracked_flows after the
-             idle sweep (e.g. a burst of tens of thousands of one-packet flows
-             from a spoofed-source flood), evict the oldest flows by last_seen
-             until back under the cap. Bounds memory even under active attack.
-
-        Cheap and safe to call once per inference batch; it only walks the
-        table, and the common case (nothing stale) is a fast scan.
-        """
+        """Legacy idle + hard-cap sweep (unscored). Kept for existing callers/tests only."""
         now = datetime.now()
-        # 1. Idle-timeout sweep
         stale = [
             k for k, f in self.flow_tracker.items()
             if (now - f['last_seen']).total_seconds() > self.flow_idle_timeout
@@ -284,10 +457,8 @@ class RealTimeIDSPipeline:
         for k in stale:
             del self.flow_tracker[k]
 
-        # 2. Hard-cap safety net
         overflow = len(self.flow_tracker) - self.max_tracked_flows
         if overflow > 0:
-            # Oldest-first by last_seen; evict just enough to get under the cap.
             oldest = sorted(
                 self.flow_tracker.items(), key=lambda kv: kv[1]['last_seen']
             )[:overflow]
@@ -304,176 +475,363 @@ class RealTimeIDSPipeline:
                 f"{max(overflow, 0)} over-cap; {len(self.flow_tracker)} flows tracked."
             )
 
+    def _evict_overflow(self) -> int:
+        """Hard cap: SCORE the oldest overflow flows, then drop them (always, via finally)."""
+        overflow = len(self.flow_tracker) - self.max_tracked_flows
+        if overflow <= 0:
+            return 0
+        oldest = [k for k, _ in heapq.nsmallest(
+            overflow, self.flow_tracker.items(), key=lambda kv: kv[1]['last_seen'])]
+        try:
+            self._score_flows(oldest)
+        finally:
+            for k in oldest:
+                self.flow_tracker.pop(k, None)
+            self.evicted_flows_total += len(oldest)
+            logger.warning(f"flow_tracker over cap: scored and evicted {len(oldest)} "
+                           f"oldest flows (total {self.evicted_flows_total})")
+        return len(oldest)
+
+    # ------------------------------------------------------------------ capture / ingest
+
     def packet_callback(self, packet):
-        """Scapy callback for each captured packet[cite: 4]."""
-        if not (IP in packet):
+        """Capture thread: summarize and hand off. No flow state, no inference, no subprocess."""
+        s = summarize(packet)
+        with self._capture_counter_lock:
+            self._capture_packets += 1
+            if s is not None:
+                self._capture_ipv4_transport_packets += 1
+        if s is None:
             return
-        
-        src_ip = packet[IP].src
-        dst_ip = packet[IP].dst
-        protocol = packet[IP].proto
-        
-        if TCP in packet:
-            src_port = packet[TCP].sport
-            dst_port = packet[TCP].dport
-        elif UDP in packet:
-            src_port = packet[UDP].sport
-            dst_port = packet[UDP].dport
-        else:
+        if self._queue is None:            # synchronous mode (tests / offline replay)
+            self._process_summary(s)
             return
-        
-        flow_key = tuple(sorted([
-            (src_ip, src_port),
-            (dst_ip, dst_port)
-        ])) + (protocol,)
-        
-        if flow_key not in self.flow_tracker:
-            self.flow_tracker[flow_key] = {
+        try:
+            self._queue.put_nowait(s)
+        except queue.Full:
+            with self._capture_counter_lock:
+                self._dropped_packets += 1
+
+    def _process_summary(self, s):
+        with self._lock:
+            self._ingest_summary(s)
+            if (len(self.packet_buffer) >= self.packet_batch_size
+                    or time.time() - self._last_batch_at >= self.batch_interval):
+                self._inference_batch()
+
+    def _ingest(self, packet):
+        """Back-compat for callers/tests that pass Scapy packets directly."""
+        s = summarize(packet)
+        if s is not None:
+            self._ingest_summary(s)
+
+    def _ingest_summary(self, s):
+        (src_ip, src_port, dst_ip, dst_port, protocol), wire_len, win, seq, ack, part = s
+        ts, plen, hlen, fl, is_tcp = part
+        flow_key = tuple(sorted([(src_ip, src_port), (dst_ip, dst_port)])) + (protocol,)
+
+        now = datetime.now()
+        flow = self.flow_tracker.get(flow_key)
+        if flow is None:
+            flow = self.flow_tracker[flow_key] = {
                 'packets': 0,
                 'bytes': 0,
-                'first_seen': datetime.now(),
-                'last_seen': datetime.now(),
+                'first_seen': now,
+                'last_seen': now,
                 'protocol': protocol,
                 'packet_list': [],
-                # The first packet observed for this flow defines "forward".
-                # CICIDS2017's Fwd/Bwd split features are meaningless without
-                # this -- every packet from here on is tagged against it.
+                # The first packet observed defines "forward".
                 'init_src': src_ip,
                 'init_sport': src_port,
                 'init_dst': dst_ip,
                 'init_dport': dst_port,
                 'fwd_win': None,
                 'bwd_win': None,
+                'done': False,
+                # True only if the first packet seen was a bare SYN.
+                'init_syn': bool(is_tcp and (fl & 0x12) == 0x02),
+                'synack_seq': None,
+                'handshake_complete': False,
             }
-        
-        flow = self.flow_tracker[flow_key]
+
         flow['packets'] += 1
-        flow['bytes'] += len(packet)
-        flow['last_seen'] = datetime.now()
+        flow['bytes'] += wire_len
+        flow['last_seen'] = now
 
         is_forward = (src_ip == flow['init_src'] and src_port == flow['init_sport'])
-        if TCP in packet:
-            win = int(packet[TCP].window)
+        if is_tcp:
             if is_forward and flow['fwd_win'] is None:
                 flow['fwd_win'] = win
-            elif not is_forward and flow['bwd_win'] is None:
+            elif not is_forward:
+                # CICFlowMeter-compatible: Init_Win_bytes_backward ends as the last
+                # observed backward window.
                 flow['bwd_win'] = win
+            # Handshake verification for AutoBlock. A blind spoofer never receives our
+            # SYN-ACK, so it cannot send a forward ACK acknowledging synack_seq + 1.
+            if (not is_forward and flow['init_syn'] and (fl & 0x12) == 0x12
+                    and flow['synack_seq'] is None):
+                flow['synack_seq'] = seq
+            elif (is_forward and flow['synack_seq'] is not None
+                    and not flow['handshake_complete'] and (fl & 0x12) == 0x10
+                    and ack == (flow['synack_seq'] + 1) % 2**32):
+                flow['handshake_complete'] = True
 
-        flow['packet_list'].append((packet, is_forward))
-        
-        self.packet_buffer.append((flow_key, packet))
-        
-        if len(self.packet_buffer) >= self.packet_batch_size:
-            self._inference_batch()
-    
+        flow['packet_list'].append(PacketSummary(ts, is_forward, plen, hlen, fl, is_tcp))
+
+        # Finished = FIN/RST seen or packet cap hit (age and idle are checked in the sweep).
+        if (is_tcp and (fl & 0x05)) or flow['packets'] >= self.max_packets_per_flow:
+            flow['done'] = True
+        if flow['done']:
+            self._done.add(flow_key)
+
+        self.packet_buffer.append(flow_key)   # only len() is used
+
+    def _collect_finished_flows(self):
+        """Keys of flows ready to be scored exactly once."""
+        keys = set(self._done)
+        self._done.clear()
+        t = time.time()
+        if t - self._last_sweep_at >= self.sweep_interval:
+            self._last_sweep_at = t
+            now = datetime.now()
+            for k, f in self.flow_tracker.items():
+                if (f.get('done')
+                        or (now - f['last_seen']).total_seconds() > self.flow_idle_timeout
+                        or (now - f['first_seen']).total_seconds() >= self.flow_max_duration):
+                    keys.add(k)
+        return [k for k in keys if k in self.flow_tracker]
+
     def _inference_batch(self):
-        """Batch inference for anomaly detection[cite: 4]."""
-        batch = self.packet_buffer.copy()
-        
-        logger.info(f"AI Analyzing batch of {len(batch)} live network packets...")
-        
-        self.packet_buffer.clear()
-        
-        if not batch:
-            return
-        
-        try:
-            features_batch = []
-            flow_keys_batch = []
+        """Score every finished flow once, then drop it. Caller must hold self._lock."""
+        n_packets = len(self.packet_buffer)
+        self.packet_buffer = []
+        self._last_batch_at = time.time()
+        finished = self._collect_finished_flows()
 
-            # Dedupe by flow: _extract_flow_features() computes over the whole
-            # flow, so scoring once per *packet* would re-score the same flow N
-            # times and emit N duplicate alerts. Score each unique flow once.
-            seen_flows = set()
-            for flow_key, packet in batch:
-                if flow_key in seen_flows:
-                    continue
-                seen_flows.add(flow_key)
-                features = self._extract_flow_features(flow_key)
-                if features is not None:
-                    features_batch.append(features)
-                    flow_keys_batch.append(flow_key)
-            
-            if not features_batch:
-                return
-            
-            features_array = np.array(features_batch)
-            features_normalized = self.feature_scaler.transform(features_array)
-            
-            reconstructed = self.autoencoder.predict(
-                features_normalized,
-                batch_size=len(features_normalized),
-                verbose=0
+        if finished:
+            logger.debug(f"AI scoring {len(finished)} finished flow(s) ({n_packets} new packets)")
+        try:
+            if finished:
+                self._score_flows(finished)
+        except Exception as e:
+            logger.error(f"Inference batch error: {e}", exc_info=True)
+        finally:
+            for k in finished:
+                self.flow_tracker.pop(k, None)
+            try:
+                self._evict_overflow()
+            except Exception as e:
+                logger.error(f"Overflow scoring failed: {e}", exc_info=True)
+            self._expire_blocks()
+
+    def _score_flows(self, keys):
+        """Extract, scale, predict and dispatch alerts for `keys`. Caller holds self._lock."""
+        features_batch = []
+        flow_keys_batch = []
+
+        for flow_key in keys:
+            features = self._extract_flow_features(flow_key)
+            if features is not None:
+                features_batch.append(features)
+                flow_keys_batch.append(flow_key)
+
+        if not features_batch:
+            return
+
+        feature_names = list(
+            getattr(
+                self.feature_scaler,
+                "feature_names_in_",
+                [f"f{i}" for i in range(len(features_batch[0]))],
+            )
+        )
+
+        if len(feature_names) != len(features_batch[0]):
+            raise ValueError(
+                f"Live feature count mismatch: expected {len(feature_names)}, "
+                f"got {len(features_batch[0])}"
             )
 
-            # Real anomaly signal: per-sample reconstruction error (MSE
-            # between the scaled input and the autoencoder's reconstruction
-            # of it). A poorly-reconstructed flow looks unlike anything the
-            # model saw during training on benign traffic.
-            recon_errors = np.mean(np.square(features_normalized - reconstructed), axis=1)
+        features_array = np.asarray(features_batch, dtype=np.float32)
+        features_df = pd.DataFrame(features_array, columns=feature_names)
+        features_normalized = self.feature_scaler.transform(features_df)
 
-            # Supervised cross-check: the Random Forest scores the exact same
-            # scaled 78-feature vectors and returns P(attack) per flow. Left as
-            # None per-flow when the RF is unavailable, so the ensemble falls
-            # back to autoencoder-only cleanly.
-            rf_attack_probs = [None] * len(flow_keys_batch)
-            # threat_names: string label per flow from the multi-class RF
-            # ("DDoS", "Port Scan" etc.) or None when binary/unavailable.
-            threat_names = [None] * len(flow_keys_batch)
-            if self.random_forest is not None:
-                try:
-                    proba = self.random_forest.predict_proba(features_normalized)
-                    rf_attack_probs = proba[:, self._rf_attack_idx]
-                    if self._rf_multiclass:
-                        # predict() gives the highest-probability class per flow.
-                        # Translate integer class IDs to human-readable names via
-                        # the label_map loaded at startup; fall back to the raw
-                        # integer string if the map doesn't cover that class.
-                        preds = self.random_forest.predict(features_normalized)
-                        threat_names = [
-                            self._label_map.get(int(p), f"Class {p}") for p in preds
-                        ]
-                except Exception as e:
-                    logger.warning(f"Random Forest inference failed this batch ({e}); using autoencoder only")
+        reconstructed = self.autoencoder.predict(
+            features_normalized,
+            batch_size=len(features_normalized),
+            verbose=0
+        )
 
-            for flow_key, recon_error, rf_prob, threat_name in zip(
-                flow_keys_batch, recon_errors, rf_attack_probs, threat_names
-            ):
-                self._process_prediction(
-                    flow_key, float(recon_error),
-                    None if rf_prob is None else float(rf_prob),
-                    threat_name,
-                )
+        sq = np.square(features_normalized - reconstructed)
+        recon_errors = np.mean(sq, axis=1)
 
+        if logger.isEnabledFor(logging.DEBUG):
+            names = self.feature_scaler.feature_names_in_
+            for i, k in enumerate(flow_keys_batch):
+                top = np.argsort(sq[i])[-3:][::-1]
+                logger.debug("TOPFEAT %s -> %s", k,
+                             ", ".join(f"{names[j]}={features_normalized[i, j]:.1f}" for j in top))
+
+        rf_attack_probs = [None] * len(flow_keys_batch)
+        threat_names = [None] * len(flow_keys_batch)
+        if self.random_forest is not None:
+            try:
+                proba = self.random_forest.predict_proba(features_normalized)
+                rf_attack_probs = attack_probability(proba, self.random_forest.classes_)
+                if self._rf_multiclass:
+                    preds = self.random_forest.predict(features_normalized)
+                    threat_names = [
+                        self._label_map.get(int(p), f"Class {p}") for p in preds
+                    ]
+            except Exception as e:
+                logger.warning(f"Random Forest inference failed this batch ({e}); using autoencoder only")
+
+        if self._dump_path:
+            self._dump_features(flow_keys_batch, features_array, recon_errors, rf_attack_probs)
+
+        failed = self._dispatch_predictions(flow_keys_batch, recon_errors,
+                                            rf_attack_probs, threat_names)
+        if failed:
+            logger.error(f"{failed} flow(s) failed alert processing this batch")
+
+    def _dispatch_predictions(self, keys, recon_errors, rf_probs, threat_names) -> int:
+        """Per-flow isolation: one bad flow must not drop alerts for the rest of the batch."""
+        failed = 0
+        for k, e, p, n in zip(keys, recon_errors, rf_probs, threat_names):
+            try:
+                self._process_prediction(k, float(e), None if p is None else float(p), n)
+            except Exception as ex:
+                failed += 1
+                logger.error(f"Alert processing failed for {k}: {ex}", exc_info=True)
+        return failed
+
+    def _dump_features(self, keys, feats, errs, rf_probs):
+        """Best-effort CSV append; must never break inference. Contains IPs -- keep it private."""
+        try:
+            import csv
+            names = list(getattr(self.feature_scaler, "feature_names_in_",
+                                 [f"f{i}" for i in range(feats.shape[1])]))
+            new_file = not os.path.exists(self._dump_path)
+            with open(self._dump_path, "a", newline="") as fh:
+                w = csv.writer(fh)
+                if new_file:
+                    w.writerow(["ts", "evidence_origin", "feature_coverage", "src_ip", "dst_ip",
+                                "dst_port", "protocol", "packets"] + names + ["recon_error", "rf_prob"])
+                for k, x, e, rp in zip(keys, feats, errs, rf_probs):
+                    f = self.flow_tracker.get(k)
+                    if f is None:
+                        continue
+                    w.writerow([int(time.time()), self.evidence_origin,
+                                self._live_feature_coverage(), f["init_src"], f["init_dst"], f["init_dport"],
+                                f["protocol"], f["packets"], *[float(v) for v in x], float(e),
+                                "" if rp is None else float(rp)])
+                    self._dump_rows += 1
+            if self._dump_rows >= self._dump_max:
+                logger.warning(f"IDS_DUMP_FEATURES reached {self._dump_max} rows; dumping stopped.")
+                self._dump_path = None
         except Exception as e:
-            logger.error(f"Inference batch error: {e}")
-        finally:
-            # Reclaim finished/stale flows every batch so the table stays
-            # bounded even under a long capture or a high-cardinality flood.
-            # In finally so eviction still runs if scoring raised above.
-            self._evict_stale_flows()
+            logger.warning(f"Feature dump failed, disabling it: {e}")
+            self._dump_path = None
+
+    def _live_feature_coverage(self):
+        """Fraction of the deployed feature schema measured by this live extractor."""
+        total = int(getattr(self.feature_scaler, "n_features_in_", 78))
+        return max(0.0, (total - len(self.UNSUPPORTED_LIVE_FEATURES)) / total)
+
+    def flush(self):
+        """Score every finished flow now (used by verify_ensemble.py, tests, shutdown)."""
+        with self._lock:
+            self._inference_batch()
+
+    # ------------------------------------------------------------------ background threads
+
+    def _tick_once(self):
+        """
+        Report capture health every 10 s. Time-based flushing belongs to the scoring
+        worker; when no worker is running (sync mode / tests) the ticker does it.
+        """
+        self._report_health()
+        if self._worker_thread is None:
+            with self._lock:
+                if time.time() - self._last_batch_at >= self.batch_interval:
+                    self._inference_batch()
+
+    def _report_health(self):
+        now = time.monotonic()
+        if now - self._capture_health_at < 10.0:
+            return
+        with self._capture_counter_lock:
+            packets = self._capture_packets
+            ipv4_transport = self._capture_ipv4_transport_packets
+            dropped = self._dropped_packets
+            self._capture_packets = 0
+            self._capture_ipv4_transport_packets = 0
+            self._dropped_packets = 0
+            self._capture_health_at = now
+
+        if self._lock.acquire(blocking=False):
+            try:
+                tracked_flows = len(self.flow_tracker)
+                buffered_packets = len(self.packet_buffer)
+            finally:
+                self._lock.release()
+        else:
+            tracked_flows = -1
+            buffered_packets = -1
+
+        qdepth = self._queue.qsize() if self._queue is not None else 0
+        logger.info(
+            "CAPTURE_HEALTH packets=%d ipv4_tcp_udp=%d dropped=%d qdepth=%d "
+            "tracked_flows=%d buffered_packets=%d",
+            packets, ipv4_transport, dropped, qdepth, tracked_flows, buffered_packets,
+        )
+        if dropped:
+            logger.warning(f"Scoring worker fell behind: dropped {dropped} packets in the last "
+                           "interval; features of affected flows are incomplete.")
+
+    def _ticker(self):
+        while not self._stop.wait(self.batch_interval):
+            try:
+                self._tick_once()
+            except Exception as e:
+                logger.error(f"Health ticker error: {e}", exc_info=True)
+
+    def _worker(self):
+        """Scoring worker: ingest queued summaries; flush on batch size or batch interval."""
+        logger.info("Scoring worker started")
+        while not self._stop.is_set():
+            try:
+                s = self._queue.get(timeout=self.batch_interval)
+            except queue.Empty:
+                try:
+                    with self._lock:
+                        self._inference_batch()      # time-based flush of idle flows
+                except Exception as e:
+                    logger.error(f"Worker flush error: {e}", exc_info=True)
+                continue
+            try:
+                self._process_summary(s)
+            except Exception as e:
+                logger.error(f"Worker ingest error: {e}", exc_info=True)
+
+    def _capture_heartbeat(self):
+        """Report capture process liveness without taking the inference lock."""
+        logger.info("CAPTURE_HEARTBEAT started")
+        while not self._stop.wait(10.0):
+            logger.info("CAPTURE_HEARTBEAT alive")
+
+    # ------------------------------------------------------------------ features
 
     def _extract_flow_features(self, flow_key: Tuple) -> np.ndarray:
-        """
-        Extract a real, correctly-ordered 78-feature CICIDS2017-compatible
-        vector from a live flow.
+        """Extract the deployed 78-feature CICFlowMeter/CICIDS representation.
 
-        Column order matches feature_scaler.pkl's feature_names_in_ exactly
-        (verified against the fitted scaler at
-        backend/models/feature_scaler.pkl). Earlier versions of this method
-        computed ~24 generic stats and zero-padded the remaining 54 slots,
-        which silently misaligned every value with the wrong column and
-        guaranteed near-maximum reconstruction error on every flow,
-        regardless of whether the traffic was actually anomalous. That bug
-        is why live detections previously showed 100% anomaly score on
-        every single flow.
+        Mirrors CICFlowMeter V4's BasicFlow.java/FlowFeature.java as closely as
+        possible from the PacketSummary records retained per flow. Training-artifact
+        version parity still must be verified before this extractor is used for
+        retraining.
 
-        A handful of CICIDS2017 columns (Fwd/Bwd Avg Bulk Rate, Active/Idle
-        Mean/Std/Max/Min) require multi-flow bulk/idle-gap analysis that
-        isn't tracked by this lightweight per-flow buffer; those are left
-        at 0, which mirrors how CICIDS2017 itself encodes "not applicable"
-        for short flows. Everything else is computed directly from the
-        real captured packets.
+        *Flag Count* features are packet counts, not booleans. SummaryStatistics
+        std-dev is sample std-dev (ddof=1).
         """
         if flow_key not in self.flow_tracker:
             return None
@@ -483,19 +841,40 @@ class RealTimeIDSPipeline:
         if not entries:
             return None
 
-        fwd_pkts = [p for p, is_fwd in entries if is_fwd]
-        bwd_pkts = [p for p, is_fwd in entries if not is_fwd]
+        # Deterministic timestamp order (capture order is normally chronological).
+        entries = sorted((_as_summary(e, flow) for e in entries), key=lambda s: s.ts)
+        fwd_pkts = [s for s in entries if s.fwd]
+        bwd_pkts = [s for s in entries if not s.fwd]
+        all_pkts = entries
 
-        flow_duration_s = (flow['last_seen'] - flow['first_seen']).total_seconds()
-        flow_duration = flow_duration_s if flow_duration_s > 0 else 0.001
-        flow_duration_us = flow_duration * 1_000_000
+        def _sample_std(values):
+            return float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
+
+        def _iat_stats(pkts):
+            if len(pkts) < 2:
+                return 0.0, 0.0, 0.0, 0.0, 0.0
+            times = np.sort(np.array([p.ts for p in pkts], dtype=np.float64))
+            iat = np.diff(times) * 1_000_000.0
+            return (float(iat.sum()), float(iat.mean()), _sample_std(iat),
+                    float(iat.max()), float(iat.min()))
+
+        packet_times = np.array([p.ts for p in all_pkts], dtype=np.float64)
+        flow_duration_s = max(float(packet_times[-1] - packet_times[0]), 0.0)
+        flow_duration_us = flow_duration_s * 1_000_000.0
+        duration_s_safe = flow_duration_s if flow_duration_s > 0 else 0.001
 
         total_fwd_packets = len(fwd_pkts)
         total_bwd_packets = len(bwd_pkts)
 
-        fwd_lengths = np.array([len(p) for p in fwd_pkts], dtype=np.float64)
-        bwd_lengths = np.array([len(p) for p in bwd_pkts], dtype=np.float64)
-        all_lengths = np.array([len(p) for p, _ in entries], dtype=np.float64)
+        fwd_lengths = np.array([p.plen for p in fwd_pkts], dtype=np.float64)
+        bwd_lengths = np.array([p.plen for p in bwd_pkts], dtype=np.float64)
+        # TODO(verify): the first packet is counted twice. Keep only if it matches
+        # BasicFlow.firstPacket() + addPacket() double-add in the reference Java;
+        # cite the line here or remove the prefix.
+        all_lengths = np.array(
+            [all_pkts[0].plen] + [p.plen for p in all_pkts],
+            dtype=np.float64,
+        )
 
         total_len_fwd = float(fwd_lengths.sum()) if len(fwd_lengths) else 0.0
         total_len_bwd = float(bwd_lengths.sum()) if len(bwd_lengths) else 0.0
@@ -503,229 +882,273 @@ class RealTimeIDSPipeline:
         fwd_pkt_max = float(fwd_lengths.max()) if len(fwd_lengths) else 0.0
         fwd_pkt_min = float(fwd_lengths.min()) if len(fwd_lengths) else 0.0
         fwd_pkt_mean = float(fwd_lengths.mean()) if len(fwd_lengths) else 0.0
-        fwd_pkt_std = float(fwd_lengths.std()) if len(fwd_lengths) > 1 else 0.0
-
+        fwd_pkt_std = _sample_std(fwd_lengths)
         bwd_pkt_max = float(bwd_lengths.max()) if len(bwd_lengths) else 0.0
         bwd_pkt_min = float(bwd_lengths.min()) if len(bwd_lengths) else 0.0
         bwd_pkt_mean = float(bwd_lengths.mean()) if len(bwd_lengths) else 0.0
-        bwd_pkt_std = float(bwd_lengths.std()) if len(bwd_lengths) > 1 else 0.0
+        bwd_pkt_std = _sample_std(bwd_lengths)
 
-        total_bytes = flow['bytes']
-        num_packets = flow['packets']
-        flow_bytes_per_s = total_bytes / flow_duration if flow_duration > 0 else 0.0
-        flow_packets_per_s = num_packets / flow_duration if flow_duration > 0 else 0.0
-        fwd_packets_per_s = total_fwd_packets / flow_duration if flow_duration > 0 else 0.0
-        bwd_packets_per_s = total_bwd_packets / flow_duration if flow_duration > 0 else 0.0
+        total_bytes = total_len_fwd + total_len_bwd
+        num_packets = len(all_pkts)
+        flow_bytes_per_s = total_bytes / duration_s_safe
+        flow_packets_per_s = num_packets / duration_s_safe
+        fwd_packets_per_s = total_fwd_packets / duration_s_safe
+        bwd_packets_per_s = total_bwd_packets / duration_s_safe
 
-        def _iat_stats(pkts):
-            if len(pkts) < 2:
-                return 0.0, 0.0, 0.0, 0.0, 0.0
-            times = np.array([float(p.time) for p in pkts], dtype=np.float64)
-            times.sort()
-            iat = np.diff(times) * 1_000_000  # microseconds
-            return float(iat.sum()), float(iat.mean()), \
-                   (float(iat.std()) if len(iat) > 1 else 0.0), \
-                   float(iat.max()), float(iat.min())
-
-        all_pkts_only = [p for p, _ in entries]
-        _, flow_iat_mean, flow_iat_std, flow_iat_max, flow_iat_min = _iat_stats(all_pkts_only)
+        _, flow_iat_mean, flow_iat_std, flow_iat_max, flow_iat_min = _iat_stats(all_pkts)
         fwd_iat_total, fwd_iat_mean, fwd_iat_std, fwd_iat_max, fwd_iat_min = _iat_stats(fwd_pkts)
         bwd_iat_total, bwd_iat_mean, bwd_iat_std, bwd_iat_max, bwd_iat_min = _iat_stats(bwd_pkts)
 
         def _flag_counts(pkts):
-            c = dict(fin=0, syn=0, rst=0, psh=0, ack=0, urg=0, cwe=0, ece=0)
-            for p in pkts:
-                if TCP in p:
-                    f = p[TCP].flags
-                    c['fin'] += int(f.F)
-                    c['syn'] += int(f.S)
-                    c['rst'] += int(f.R)
-                    c['psh'] += int(f.P)
-                    c['ack'] += int(f.A)
-                    c['urg'] += int(f.U)
-                    c['cwe'] += int(getattr(f, 'C', 0) or 0)
-                    c['ece'] += int(getattr(f, 'E', 0) or 0)
-            return c
+            return {n: sum(1 for s in pkts if s.is_tcp and s.flags & b)
+                    for n, b in _FLAG_BITS.items()}
 
         fwd_flags = _flag_counts(fwd_pkts)
         bwd_flags = _flag_counts(bwd_pkts)
-        all_flags = _flag_counts(all_pkts_only)
+        all_flags = _flag_counts(all_pkts)
 
-        def _ip_header_len(p):
-            # IP header length (4-byte words -> bytes) + TCP/UDP header length
-            ihl_bytes = int(p[IP].ihl) * 4 if hasattr(p[IP], 'ihl') and p[IP].ihl else 20
-            if TCP in p:
-                data_offset = int(p[TCP].dataofs) * 4 if p[TCP].dataofs else 20
-                return ihl_bytes + data_offset
-            if UDP in p:
-                return ihl_bytes + 8
-            return ihl_bytes
-
-        fwd_header_len = float(sum(_ip_header_len(p) for p in fwd_pkts))
-        bwd_header_len = float(sum(_ip_header_len(p) for p in bwd_pkts))
+        fwd_header_len = float(sum(p.hlen for p in fwd_pkts))
+        bwd_header_len = float(sum(p.hlen for p in bwd_pkts))
 
         min_pkt_len = float(all_lengths.min()) if len(all_lengths) else 0.0
         max_pkt_len = float(all_lengths.max()) if len(all_lengths) else 0.0
         pkt_len_mean = float(all_lengths.mean()) if len(all_lengths) else 0.0
-        pkt_len_std = float(all_lengths.std()) if len(all_lengths) > 1 else 0.0
-        pkt_len_var = float(all_lengths.var()) if len(all_lengths) > 1 else 0.0
+        pkt_len_std = _sample_std(all_lengths)
+        pkt_len_var = float(np.var(all_lengths, ddof=1)) if len(all_lengths) > 1 else 0.0
 
-        down_up_ratio = (total_bwd_packets / total_fwd_packets) if total_fwd_packets > 0 else 0.0
+        # Java: (double)(backward.size() / forward.size()) -- integer division.
+        down_up_ratio = (
+            float(total_bwd_packets // total_fwd_packets) if total_fwd_packets else 0.0
+        )
         avg_pkt_size = float(all_lengths.mean()) if len(all_lengths) else 0.0
         avg_fwd_segment_size = fwd_pkt_mean
         avg_bwd_segment_size = bwd_pkt_mean
 
-        init_win_fwd = float(flow['fwd_win']) if flow['fwd_win'] is not None else -1.0
-        init_win_bwd = float(flow['bwd_win']) if flow['bwd_win'] is not None else -1.0
-        act_data_pkt_fwd = float(sum(1 for p in fwd_pkts if len(p) > _ip_header_len(p)))
-        min_seg_size_fwd = float(min((_ip_header_len(p) for p in fwd_pkts), default=0))
+        init_win_fwd = float(flow['fwd_win']) if flow['fwd_win'] is not None else 0.0
+        init_win_bwd = float(flow['bwd_win']) if flow['bwd_win'] is not None else 0.0
+        # First forward packet excluded; subsequent forward packets with payload counted.
+        act_data_pkt_fwd = float(sum(1 for p in fwd_pkts[1:] if p.plen >= 1))
+        min_seg_size_fwd = float(min((p.hlen for p in fwd_pkts), default=0))
+
+        # --- CICFlowMeter subflow statistics ---------------------------------
+        sf_count = 0
+        last_ts_us = None
+        for p in all_pkts:
+            ts_us = int(round(p.ts * 1_000_000.0))
+            if last_ts_us is not None and (ts_us - last_ts_us) > self.CICFLOWMETER_ACTIVITY_TIMEOUT_US:
+                sf_count += 1
+            last_ts_us = ts_us
+        if sf_count > 0:
+            subflow_fwd_packets = total_fwd_packets // sf_count
+            subflow_fwd_bytes = int(total_len_fwd) // sf_count
+            subflow_bwd_packets = total_bwd_packets // sf_count
+            subflow_bwd_bytes = int(total_len_bwd) // sf_count
+        else:
+            subflow_fwd_packets = subflow_fwd_bytes = 0
+            subflow_bwd_packets = subflow_bwd_bytes = 0
+
+        # --- CICFlowMeter bulk statistics ------------------------------------
+        # Mirror BasicFlow.updateForwardBulk/updateBackwardBulk: only payload packets
+        # participate; a >1s gap starts a new candidate; a bulk is recognized on its
+        # 4th payload packet and subsequent packets extend it.
+        fbulk_state_count = fbulk_packet_count = fbulk_size_total = fbulk_duration = 0
+        bbulk_state_count = bbulk_packet_count = bbulk_size_total = bbulk_duration = 0
+
+        fhelper_start = None
+        fhelper_count = 0
+        fhelper_size = 0
+
+        bhelper_start = None
+        bhelper_count = 0
+        bhelper_size = 0
+
+        last_f_bulk_ts = 0
+        last_b_bulk_ts = 0
+
+        for p in entries:
+            size = p.plen
+            if size <= 0:
+                continue
+            is_fwd = p.fwd
+            ts_us = int(round(p.ts * 1_000_000.0))
+
+            if is_fwd:
+                # Opposite-direction bulk timestamp cancels a pending candidate.
+                if fhelper_start is not None and last_b_bulk_ts > fhelper_start:
+                    fhelper_start = None
+
+                if fhelper_start is None:
+                    fhelper_start = ts_us
+                    last_f_bulk_ts = ts_us
+                    fhelper_count = 1
+                    fhelper_size = size
+                elif (ts_us - last_f_bulk_ts) > self.CICFLOWMETER_ACTIVITY_TIMEOUT_US:
+                    fhelper_start = ts_us
+                    last_f_bulk_ts = ts_us
+                    fhelper_count = 1
+                    fhelper_size = size
+                else:
+                    fhelper_count += 1
+                    fhelper_size += size
+                    if fhelper_count == 4:
+                        fbulk_state_count += 1
+                        fbulk_packet_count += fhelper_count
+                        fbulk_size_total += fhelper_size
+                        fbulk_duration += ts_us - fhelper_start
+                    elif fhelper_count > 4:
+                        fbulk_packet_count += 1
+                        fbulk_size_total += size
+                        fbulk_duration += ts_us - last_f_bulk_ts
+                    last_f_bulk_ts = ts_us
+            else:
+                if bhelper_start is not None and last_f_bulk_ts > bhelper_start:
+                    bhelper_start = None
+
+                if bhelper_start is None:
+                    bhelper_start = ts_us
+                    last_b_bulk_ts = ts_us
+                    bhelper_count = 1
+                    bhelper_size = size
+                elif (ts_us - last_b_bulk_ts) > self.CICFLOWMETER_ACTIVITY_TIMEOUT_US:
+                    bhelper_start = ts_us
+                    last_b_bulk_ts = ts_us
+                    bhelper_count = 1
+                    bhelper_size = size
+                else:
+                    bhelper_count += 1
+                    bhelper_size += size
+                    if bhelper_count == 4:
+                        bbulk_state_count += 1
+                        bbulk_packet_count += bhelper_count
+                        bbulk_size_total += bhelper_size
+                        bbulk_duration += ts_us - bhelper_start
+                    elif bhelper_count > 4:
+                        bbulk_packet_count += 1
+                        bbulk_size_total += size
+                        bbulk_duration += ts_us - last_b_bulk_ts
+                    last_b_bulk_ts = ts_us
+
+        fwd_avg_bytes_bulk = (fbulk_size_total // fbulk_state_count) if fbulk_state_count else 0
+        fwd_avg_packets_bulk = (fbulk_packet_count // fbulk_state_count) if fbulk_state_count else 0
+        fwd_avg_bulk_rate = int(fbulk_size_total / (fbulk_duration / 1_000_000.0)) if fbulk_duration else 0
+        bwd_avg_bytes_bulk = (bbulk_size_total // bbulk_state_count) if bbulk_state_count else 0
+        bwd_avg_packets_bulk = (bbulk_packet_count // bbulk_state_count) if bbulk_state_count else 0
+        bwd_avg_bulk_rate = int(bbulk_size_total / (bbulk_duration / 1_000_000.0)) if bbulk_duration else 0
+
+        # --- CICFlowMeter active/idle statistics ------------------------------
+        active_intervals = []
+        idle_intervals = []
+        start_active = end_active = int(round(all_pkts[0].ts * 1_000_000.0))
+        for p in all_pkts[1:]:
+            ts_us = int(round(p.ts * 1_000_000.0))
+            if (ts_us - end_active) > self.CICFLOWMETER_ACTIVITY_TIMEOUT_US:
+                if (end_active - start_active) > 0:
+                    active_intervals.append(end_active - start_active)
+                idle_intervals.append(ts_us - end_active)
+                start_active = end_active = ts_us
+            else:
+                end_active = ts_us
+        if (end_active - start_active) > 0:
+            active_intervals.append(end_active - start_active)
+
+        def _summary(values):
+            if not values:
+                return 0.0, 0.0, 0.0, 0.0
+            a = np.asarray(values, dtype=np.float64)
+            return float(a.mean()), _sample_std(a), float(a.max()), float(a.min())
+
+        active_mean, active_std, active_max, active_min = _summary(active_intervals)
+        idle_mean, idle_std, idle_max, idle_min = _summary(idle_intervals)
 
         dst_port = flow['init_dport']
 
-        # Ordered to exactly match feature_scaler.pkl's feature_names_in_
         features = np.array([
-            dst_port,                          # 0  Destination Port
-            flow_duration_us,                  # 1  Flow Duration
-            total_fwd_packets,                 # 2  Total Fwd Packets
-            total_bwd_packets,                 # 3  Total Backward Packets
-            total_len_fwd,                     # 4  Total Length of Fwd Packets
-            total_len_bwd,                     # 5  Total Length of Bwd Packets
-            fwd_pkt_max,                       # 6  Fwd Packet Length Max
-            fwd_pkt_min,                       # 7  Fwd Packet Length Min
-            fwd_pkt_mean,                      # 8  Fwd Packet Length Mean
-            fwd_pkt_std,                       # 9  Fwd Packet Length Std
-            bwd_pkt_max,                       # 10 Bwd Packet Length Max
-            bwd_pkt_min,                       # 11 Bwd Packet Length Min
-            bwd_pkt_mean,                      # 12 Bwd Packet Length Mean
-            bwd_pkt_std,                       # 13 Bwd Packet Length Std
-            flow_bytes_per_s,                  # 14 Flow Bytes/s
-            flow_packets_per_s,                # 15 Flow Packets/s
-            flow_iat_mean,                     # 16 Flow IAT Mean
-            flow_iat_std,                      # 17 Flow IAT Std
-            flow_iat_max,                      # 18 Flow IAT Max
-            flow_iat_min,                      # 19 Flow IAT Min
-            fwd_iat_total,                     # 20 Fwd IAT Total
-            fwd_iat_mean,                      # 21 Fwd IAT Mean
-            fwd_iat_std,                       # 22 Fwd IAT Std
-            fwd_iat_max,                       # 23 Fwd IAT Max
-            fwd_iat_min,                       # 24 Fwd IAT Min
-            bwd_iat_total,                     # 25 Bwd IAT Total
-            bwd_iat_mean,                      # 26 Bwd IAT Mean
-            bwd_iat_std,                       # 27 Bwd IAT Std
-            bwd_iat_max,                       # 28 Bwd IAT Max
-            bwd_iat_min,                       # 29 Bwd IAT Min
-            float(fwd_flags['psh']),           # 30 Fwd PSH Flags
-            float(bwd_flags['psh']),           # 31 Bwd PSH Flags
-            float(fwd_flags['urg']),           # 32 Fwd URG Flags
-            float(bwd_flags['urg']),           # 33 Bwd URG Flags
-            fwd_header_len,                    # 34 Fwd Header Length
-            bwd_header_len,                    # 35 Bwd Header Length
-            fwd_packets_per_s,                 # 36 Fwd Packets/s
-            bwd_packets_per_s,                 # 37 Bwd Packets/s
-            min_pkt_len,                       # 38 Min Packet Length
-            max_pkt_len,                       # 39 Max Packet Length
-            pkt_len_mean,                      # 40 Packet Length Mean
-            pkt_len_std,                       # 41 Packet Length Std
-            pkt_len_var,                       # 42 Packet Length Variance
-            float(all_flags['fin']),           # 43 FIN Flag Count
-            float(all_flags['syn']),           # 44 SYN Flag Count
-            float(all_flags['rst']),           # 45 RST Flag Count
-            float(all_flags['psh']),           # 46 PSH Flag Count
-            float(all_flags['ack']),           # 47 ACK Flag Count
-            float(all_flags['urg']),           # 48 URG Flag Count
-            float(all_flags['cwe']),           # 49 CWE Flag Count
-            float(all_flags['ece']),           # 50 ECE Flag Count
-            down_up_ratio,                     # 51 Down/Up Ratio
-            avg_pkt_size,                      # 52 Average Packet Size
-            avg_fwd_segment_size,              # 53 Avg Fwd Segment Size
-            avg_bwd_segment_size,              # 54 Avg Bwd Segment Size
-            fwd_header_len,                    # 55 Fwd Header Length.1 (CICIDS duplicates this column)
-            0.0,                               # 56 Fwd Avg Bytes/Bulk (not tracked — short live flows)
-            0.0,                               # 57 Fwd Avg Packets/Bulk
-            0.0,                               # 58 Fwd Avg Bulk Rate
-            0.0,                               # 59 Bwd Avg Bytes/Bulk
-            0.0,                               # 60 Bwd Avg Packets/Bulk
-            0.0,                               # 61 Bwd Avg Bulk Rate
-            total_fwd_packets,                 # 62 Subflow Fwd Packets
-            total_len_fwd,                     # 63 Subflow Fwd Bytes
-            total_bwd_packets,                 # 64 Subflow Bwd Packets
-            total_len_bwd,                     # 65 Subflow Bwd Bytes
-            init_win_fwd,                      # 66 Init_Win_bytes_forward
-            init_win_bwd,                      # 67 Init_Win_bytes_backward
-            act_data_pkt_fwd,                  # 68 act_data_pkt_fwd
-            min_seg_size_fwd,                  # 69 min_seg_size_forward
-            0.0,                               # 70 Active Mean (not tracked)
-            0.0,                               # 71 Active Std
-            0.0,                               # 72 Active Max
-            0.0,                               # 73 Active Min
-            0.0,                               # 74 Idle Mean
-            0.0,                               # 75 Idle Std
-            0.0,                               # 76 Idle Max
-            0.0,                               # 77 Idle Min
+            dst_port, flow_duration_us,
+            total_fwd_packets, total_bwd_packets,
+            total_len_fwd, total_len_bwd,
+            fwd_pkt_max, fwd_pkt_min, fwd_pkt_mean, fwd_pkt_std,
+            bwd_pkt_max, bwd_pkt_min, bwd_pkt_mean, bwd_pkt_std,
+            flow_bytes_per_s, flow_packets_per_s,
+            flow_iat_mean, flow_iat_std, flow_iat_max, flow_iat_min,
+            fwd_iat_total, fwd_iat_mean, fwd_iat_std, fwd_iat_max, fwd_iat_min,
+            bwd_iat_total, bwd_iat_mean, bwd_iat_std, bwd_iat_max, bwd_iat_min,
+            float(fwd_flags['psh']), float(bwd_flags['psh']),
+            float(fwd_flags['urg']), float(bwd_flags['urg']),
+            fwd_header_len, bwd_header_len,
+            fwd_packets_per_s, bwd_packets_per_s,
+            min_pkt_len, max_pkt_len, pkt_len_mean, pkt_len_std, pkt_len_var,
+            float(all_flags['fin']), float(all_flags['syn']), float(all_flags['rst']),
+            float(all_flags['psh']), float(all_flags['ack']), float(all_flags['urg']),
+            float(all_flags['cwe']), float(all_flags['ece']),
+            down_up_ratio, avg_pkt_size, avg_fwd_segment_size, avg_bwd_segment_size,
+            fwd_header_len,
+            fwd_avg_bytes_bulk, fwd_avg_packets_bulk, fwd_avg_bulk_rate,
+            bwd_avg_bytes_bulk, bwd_avg_packets_bulk, bwd_avg_bulk_rate,
+            subflow_fwd_packets, subflow_fwd_bytes, subflow_bwd_packets, subflow_bwd_bytes,
+            init_win_fwd, init_win_bwd, act_data_pkt_fwd, min_seg_size_fwd,
+            active_mean, active_std, active_max, active_min,
+            idle_mean, idle_std, idle_max, idle_min,
         ], dtype=np.float32)
 
+        if features.shape != (78,):
+            raise RuntimeError(f"CICFlowMeter feature vector has wrong shape: {features.shape}")
         return features
+
+    # ------------------------------------------------------------------ fusion / alerting
 
     def _process_prediction(self, flow_key, recon_error: float,
                             rf_attack_prob: float = None,
                             threat_name: str = None):
         """
-        Processes a real reconstruction-error value and triggers alerts/IPS.
+        ae_score = e / (e + recon_threshold): 0.5 at the benign-calibrated threshold.
 
-        recon_error is the raw MSE between a flow's scaled features and the
-        autoencoder's reconstruction of them — unbounded and scale-dependent.
-        We convert it to a bounded (0,1) autoencoder score using the calibrated
-        threshold (self.recon_threshold, the benign-data error level above
-        which traffic is considered anomalous): score = e / (e + threshold).
-        At exactly the threshold this gives 0.5; well below it tends to 0;
-        well above it saturates toward 1 — and it stays compatible with the
-        Settings page's 0-1 Critical/High sliders without needing to assume
-        a fixed scale for raw MSE.
-
-        FUSION — confidence-override (not a plain average). When the Random
-        Forest is available, the baseline score is the 0.5/0.5 average of the
-        autoencoder's unsupervised score and the RF's supervised P(attack).
-        BUT a highly-confident single model overrides that average:
-          * ae_score > AE_OVERRIDE_CONF  -> alert as a possible NOVEL attack.
-            This is essential: a plain average lets the RF veto the AE, which
-            would defeat the whole point of the unsupervised model (catching
-            attacks the supervised RF was never trained on). The SYN-flood case
-            in verify_ensemble.py demonstrated exactly this failure.
-          * rf_attack_prob > RF_OVERRIDE_CONF -> alert as a KNOWN attack the RF
-            recognises with high confidence, even if the AE reconstructs it well.
-        When an override fires, the reported anomaly_score is raised to the
-        triggering model's confidence so severity/labelling reflect why we
-        actually alerted, rather than the diluted average. All sub-scores are
-        recorded on the alert so the dashboard (and thesis) can show the reason.
+        FUSION — confidence-override. With the RF available, the baseline is the
+        0.5/0.5 average of ae_score and RF P(attack). A single confident model overrides:
+          * rf_attack_prob > RF_OVERRIDE_CONF -> KNOWN attack (checked first).
+          * ae_score > AE_OVERRIDE_CONF -> possible NOVEL attack.
+        An override is only labelled when the resulting score crosses the alert cutoff.
         """
+        if rf_attack_prob is None and not self.ae_only_alerting_validated:
+            self._ae_only_suppressed += 1
+            if self._ae_only_suppressed == 1 or self._ae_only_suppressed % 1000 == 0:
+                logger.warning(
+                    f"Suppressing AE-only results ({self._ae_only_suppressed} so far): live score "
+                    "variance has not been validated (set IDS_AE_ONLY_ALERTING_VALIDATED=true "
+                    "only after live-lab validation)."
+                )
+            return
+
         ae_score = recon_error / (recon_error + self.recon_threshold)
+
+        flow = self.flow_tracker[flow_key]
+        # Stored initiator, NOT flow_key[0][0] (flow_key is sorted).
+        src_ip = flow['init_src']
+        settings = self._load_settings()
+
+        sensitivity_cutoffs = {
+            "low": min(0.99, self.alert_threshold + 0.10),
+            "medium": self.alert_threshold,
+            "high": max(0.50, self.alert_threshold - 0.15),
+        }
+        alert_cutoff = sensitivity_cutoffs.get(
+            settings.get("sensitivity", "medium"), self.alert_threshold
+        )
 
         override_reason = None
         if rf_attack_prob is not None:
             fused_score = 0.5 * ae_score + 0.5 * rf_attack_prob
-            if ae_score > self.AE_OVERRIDE_CONF:
-                override_reason = 'autoencoder override (possible novel attack)'
-                anomaly_score = max(fused_score, ae_score)
-            elif rf_attack_prob > self.RF_OVERRIDE_CONF:
+            anomaly_score = fused_score
+            if rf_attack_prob > self.RF_OVERRIDE_CONF:
                 override_reason = 'random forest override (known attack pattern)'
                 anomaly_score = max(fused_score, rf_attack_prob)
-            else:
-                anomaly_score = fused_score
+            elif ae_score > self.AE_OVERRIDE_CONF:
+                override_reason = 'autoencoder override (possible novel attack)'
+                anomaly_score = max(fused_score, ae_score)
+            if override_reason and anomaly_score <= alert_cutoff:
+                override_reason = None   # did not alert -> do not claim it did
         else:
-            # AE-only mode: the autoencoder score IS the anomaly score.
             fused_score = ae_score
             anomaly_score = ae_score
-
-        flow = self.flow_tracker[flow_key]
-        # Use the stored flow initiator, NOT flow_key[0][0]: flow_key is
-        # built with sorted([...]), so flow_key[0] is the lexicographically
-        # smaller endpoint, not the real source. Using it here would mislabel
-        # alerts and could auto-block the wrong IP (e.g. the victim/host).
-        src_ip = flow['init_src']
-        settings = self._load_settings()
-
-        # Whitelist protection to prevent blocking the host or router
-        whitelist = ['192.168.18.1', '192.168.18.12']
 
         if flow['packets'] >= 2:
             rf_str = 'n/a' if rf_attack_prob is None else f"{rf_attack_prob:.4f}"
@@ -737,19 +1160,25 @@ class RealTimeIDSPipeline:
                 f"packets={flow['packets']} bytes={flow['bytes']} src={src_ip}"
             )
 
-        # Alert if the (possibly override-boosted) score clears the bar. The
-        # override_reason already boosted anomaly_score above, so this single
-        # gate covers both the averaged case and the single-model overrides.
-        if anomaly_score > self.alert_threshold:
+        if anomaly_score > alert_cutoff:
             severity = self._compute_severity(anomaly_score, settings)
-            
+
+            # Cooldown per (source, severity), not per port (port scans rotate ports).
+            k = (src_ip, severity)
+            now = time.time()
+            last, suppressed = self._last_alert.get(k, (0.0, 0))
+            if now - last < self.alert_cooldown:
+                self._last_alert[k] = (last, suppressed + 1)
+                return
+            self._last_alert[k] = (now, 0)
+            if len(self._last_alert) > 10000:
+                self._last_alert = {a: v for a, v in self._last_alert.items()
+                                    if v[0] > now - self.alert_cooldown}
+
             alert_payload = {
                 'timestamp': int(time.time()),
                 'flow_key': src_ip,
                 'anomaly_score': anomaly_score,
-                # Sub-scores kept for transparency: the unsupervised autoencoder
-                # score and the supervised RF P(attack). rf_attack_prob is null
-                # when the RF wasn't available and the ensemble ran AE-only.
                 'ae_anomaly_score': ae_score,
                 'rf_attack_prob': rf_attack_prob,
                 'fused_score': fused_score,
@@ -758,9 +1187,6 @@ class RealTimeIDSPipeline:
                     else 'ensemble (autoencoder + random forest)'
                     if rf_attack_prob is not None else 'autoencoder only'
                 ),
-                # threat_name is set by a multi-class RF and names the
-                # attack category ("DDoS", "Port Scan", etc.).  Falls back
-                # to a generic label when the RF is binary or unavailable.
                 'threat_type': threat_name if threat_name and threat_name != 'Benign'
                                else 'Network Anomaly',
                 'severity': severity,
@@ -769,41 +1195,138 @@ class RealTimeIDSPipeline:
                 'protocol': 'TCP' if flow['protocol'] == 6 else 'UDP',
                 'packet_count': flow['packets'],
                 'bytes_transferred': flow['bytes'],
-                'flow_duration': (flow['last_seen'] - flow['first_seen']).total_seconds()
+                'flow_duration': (flow['last_seen'] - flow['first_seen']).total_seconds(),
+                'feature_coverage': self._live_feature_coverage(),
+                'unsupported_live_features': list(self.UNSUPPORTED_LIVE_FEATURES),
+                'evidence_origin': getattr(self, 'evidence_origin', 'live_unclassified'),
+                'suppressed_since_last': suppressed,
             }
-            
+
+            try:
+                alert_payload.update(save_threat_evidence(alert_payload))
+            except Exception as e:
+                logger.warning(f"Could not save threat evidence snapshot: {e}")
+
             if self.redis_client:
                 try:
-                    self.redis_client.xadd('ids:alerts', {'data': json.dumps(alert_payload)})
+                    self.redis_client.xadd(
+                        'ids:alerts', {'data': json.dumps(alert_payload)},
+                        maxlen=5000, approximate=True,
+                    )
                 except Exception as e:
                     logger.warning(f"Redis failed: {e}")
 
-            # IPS Trigger: only auto-block if the operator has explicitly
-            # enabled it via the Settings page (default OFF — auto-blocking
-            # real traffic is destructive enough that it shouldn't be on by
-            # default just because a container booted).
-            auto_block_enabled = settings.get('autoBlock', False)
-            if auto_block_enabled and severity == 'CRITICAL' and src_ip not in whitelist:
-                try:
-                    block_ip(src_ip)
-                except Exception as e:
-                    logger.error(f"Failed to block IP: {e}")
+            # AutoBlock: opt-in via Settings (default OFF).
+            if settings.get('autoBlock', False) and severity == 'CRITICAL' and self._should_block(flow):
+                self._block(src_ip)
 
-    # NOTE: a previous _classify_threat() here mapped model output to five
-    # named attack classes (DoS/Port Scan/Brute Force/Web Attack). It was dead
-    # code AND misleading: the deployed Random Forest is binary (benign/attack,
-    # classes_ == [0, 1]), so it cannot name an attack subtype. Multi-class
-    # threat typing would require retraining the RF/CNN on CICIDS2017's original
-    # per-attack labels (they are currently collapsed to 0/1 in
-    # data_preprocessing.py). Removed rather than left in to avoid implying a
-    # capability the model doesn't have. See thesis "Future Work".
+    # ------------------------------------------------------------------ IPS guardrails
+
+    def _should_block(self, flow) -> bool:
+        """
+        Permit AutoBlock only for an inbound TCP flow to one of this host's IPs whose
+        initiator COMPLETED a handshake (bare SYN, our SYN-ACK, forward ACK of
+        synack_seq + 1). SYN floods are never auto-blocked; use SYN cookies.
+        """
+        src = flow['init_src']
+        if src in self._whitelist or src in self._blocked:
+            return False
+        if len(self._blocked) >= self.MAX_ACTIVE_BLOCKS:
+            logger.warning(f"[IPS] {len(self._blocked)} active blocks (cap); not blocking {src}")
+            return False
+        if (flow['protocol'] != 6 or not flow.get('init_syn')
+                or not flow.get('handshake_complete')):
+            return False
+        if time.time() - self._local_ips_at > 60:
+            self._local_ips, self._local_ips_at = _local_ips(), time.time()
+        return flow['init_dst'] in self._local_ips
+
+    def _load_autoblock_state(self):
+        """Restore non-expired IDS blocks and reconcile against the actual firewall."""
+        now = time.time()
+        try:
+            with open(self._autoblock_state_path, encoding="utf-8") as f:
+                raw = json.load(f)
+            self._blocked = {
+                str(ip): float(until)
+                for ip, until in raw.items()
+                if float(until) > now and ipaddress.ip_address(ip).is_global
+            }
+        except FileNotFoundError:
+            self._blocked = {}
+        except Exception as e:
+            logger.warning(f"[IPS] Could not load AutoBlock state: {e}; starting with no tracked blocks")
+            self._blocked = {}
+
+        system = platform.system().lower()
+        if system == "linux":
+            try:
+                out = _fw(["iptables", "-S", "INPUT"])
+                present = set()
+                if out.returncode == 0:
+                    for line in out.stdout.decode(errors="replace").splitlines():
+                        if IDS_IPTABLES_COMMENT not in line or " -j DROP" not in line:
+                            continue
+                        parts = line.split()
+                        if "-s" not in parts:
+                            continue
+                        # iptables -S prints "-s 203.0.113.7/32"; strip the prefix length.
+                        ip = parts[parts.index("-s") + 1].split("/", 1)[0]
+                        present.add(ip)
+                        if ip not in self._blocked:
+                            unblock_ip(ip)
+                for ip in list(self._blocked):
+                    if ip not in present:
+                        self._blocked.pop(ip, None)
+            except Exception as e:
+                logger.warning(f"[IPS] Could not reconcile Linux firewall rules: {e}")
+        elif system == "windows":
+            for ip in list(self._blocked):
+                try:
+                    name = f"Block_IDS_{ip}"
+                    result = _fw(["netsh", "advfirewall", "firewall", "show", "rule", f"name={name}"])
+                    if result.returncode != 0:
+                        self._blocked.pop(ip, None)
+                except Exception as e:
+                    logger.warning(f"[IPS] Could not reconcile Windows rule for {ip}: {e}")
+
+        self._persist_autoblock_state()
+
+    def _persist_autoblock_state(self):
+        try:
+            path = os.path.abspath(self._autoblock_state_path)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._blocked, f, indent=2, sort_keys=True)
+            os.replace(tmp, path)
+        except Exception as e:
+            logger.warning(f"[IPS] Could not persist AutoBlock state: {e}")
+
+    def _block(self, ip):
+        if block_ip(ip):
+            self._blocked[ip] = time.time() + self.block_ttl
+            self._persist_autoblock_state()
+
+    def _expire_blocks(self):
+        now = time.time()
+        changed = False
+        for ip in [ip for ip, until in self._blocked.items() if until <= now]:
+            unblock_ip(ip)
+            self._blocked.pop(ip, None)
+            changed = True
+        if changed:
+            self._persist_autoblock_state()
+
+    def release_blocks(self):
+        """Remove every IDS-owned rule this process tracks (called on clean shutdown)."""
+        for ip in list(self._blocked):
+            unblock_ip(ip)
+            self._blocked.pop(ip, None)
+        self._persist_autoblock_state()
 
     def _compute_severity(self, anomaly_score: float, settings: dict = None) -> str:
-        """
-        Severity bands are driven by the Critical/High thresholds saved on
-        the Settings page (defaults: 0.95 / 0.85) instead of fixed constants,
-        so the sliders shown in the UI actually change detection behavior.
-        """
+        """Severity bands from the Settings page thresholds (defaults 0.95 / 0.85)."""
         settings = settings or {}
         critical_threshold = settings.get('criticalThreshold', 0.95)
         high_threshold = settings.get('highThreshold', 0.85)
@@ -813,16 +1336,70 @@ class RealTimeIDSPipeline:
             return 'HIGH'
         else:
             return 'MEDIUM'
-    
+
+    @staticmethod
+    def _capture_filter(local_ips=None) -> str:
+        """
+        BPF filter excluding the sensor's own plumbing (REDIS_PORT, PORT,
+        IDS_EXCLUDE_PORTS) only where one end is this host. Remaining blind spot:
+        external traffic TO those local ports; keep them bound to loopback.
+        """
+        ports = {int(os.environ.get("REDIS_PORT", "6379")), int(os.environ.get("PORT", "5000"))}
+        for p in os.environ.get("IDS_EXCLUDE_PORTS", "").split(","):
+            if p.strip().isdigit():
+                ports.add(int(p.strip()))
+        ips = sorted(local_ips if local_ips is not None else _local_ips())
+        if not ips:
+            logger.warning("Could not determine local IPs; excluding plumbing ports on ALL hosts "
+                           "(attacks on those ports elsewhere will be invisible).")
+            return "(tcp or udp)" + "".join(f" and not port {p}" for p in sorted(ports))
+        hosts = " or ".join(f"host {ip}" for ip in ips)
+        return "(tcp or udp)" + "".join(f" and not (port {p} and ({hosts}))" for p in sorted(ports))
+
     def start_capture(self, interface: str = 'eth0', packet_count: int = 0):
-        logger.info(f"Starting packet capture on {interface}")
+        bpf = self._capture_filter()
+        logger.info(f"Starting packet capture on {interface} (filter: {bpf})")
+        self._stop.clear()
+        if self._queue is None:
+            self._queue = queue.Queue(maxsize=int(os.environ.get("IDS_QUEUE_MAX", "50000")))
+        self._worker_thread = threading.Thread(target=self._worker, daemon=True,
+                                               name="ids-scoring-worker")
+        self._worker_thread.start()
+        threading.Thread(target=self._ticker, daemon=True, name="ids-health-ticker").start()
+        threading.Thread(target=self._capture_heartbeat, daemon=True, name="ids-capture-heartbeat").start()
         try:
-            sniff(
-                iface=interface if interface and interface != 'auto' else None,
-                prn=self.packet_callback,
-                store=False,
-                count=packet_count
-            )
+            while not self._stop.is_set():
+                sniff(
+                    iface=interface if interface and interface != 'auto' else None,
+                    prn=self.packet_callback,
+                    store=False,
+                    count=packet_count,
+                    filter=bpf,
+                    timeout=10 if packet_count == 0 else None,
+                )
+                if packet_count > 0 or self._stop.is_set():
+                    break
+                logger.warning("Scapy capture session returned; reopening interface '%s'.", interface)
+                self._stop.wait(0.5)
         except Exception as e:
             logger.error(f"Packet capture error: {e}")
             raise
+        finally:
+            self._stop.set()
+            if self._worker_thread is not None:
+                self._worker_thread.join(timeout=5)
+            # Drain what the worker didn't reach, then score everything still open.
+            try:
+                while True:
+                    self._process_summary(self._queue.get_nowait())
+            except queue.Empty:
+                pass
+            except Exception as e:
+                logger.error(f"Shutdown drain error: {e}", exc_info=True)
+            try:
+                with self._lock:
+                    self._last_sweep_at = 0.0
+                    self._inference_batch()
+            except Exception as e:
+                logger.error(f"Shutdown flush error: {e}", exc_info=True)
+            self.release_blocks()
