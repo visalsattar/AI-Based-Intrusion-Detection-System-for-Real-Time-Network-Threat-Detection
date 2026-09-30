@@ -24,6 +24,8 @@ const socket = io("/", {
 });
 
 const SEVERITY_COLOR = { CRITICAL: '#EF4444', HIGH: '#F59E0B', MEDIUM: '#38BDF8' };
+const CARTO_KEY = process.env.REACT_APP_CARTO_KEY;
+const TILE_URL = `https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png${CARTO_KEY ? `?key=${CARTO_KEY}` : ''}`;
 
 // The signature element: a literal signal trace. Animates only while genuinely connected.
 const PulseLine = ({ connected }) => (
@@ -47,11 +49,27 @@ const downloadJSON = (data, filename) => {
   URL.revokeObjectURL(url);
 };
 
+const alertKey = (alert) => [
+  alert.timestamp,
+  alert.src_ip,
+  alert.dst_ip,
+  alert.packet_count,
+  alert.bytes_transferred,
+  alert.anomaly_score,
+].join('|');
+
+const mergeAlerts = (current, incoming) => {
+  const merged = Array.isArray(incoming) ? [...incoming, ...current] : [incoming, ...current];
+  return Array.from(new Map(merged.map(alert => [alertKey(alert), alert])).values())
+    .slice(0, 100);
+};
+
 const Dashboard = () => {
   const [sysHealth, setSysHealth] = useState({ cpu: 0, ram: 0, disk: 0 });
   const [alerts, setAlerts] = useState([]);
   const [devices, setDevices] = useState([]);
   const [isConnected, setIsConnected] = useState(false);
+  const [soundEnabled, setSoundEnabled] = useState(true);
   const [scanning, setScanning] = useState(false);
   const [uptimeStart] = useState(Date.now());
   const [uptime, setUptime] = useState('0h 0m 0s');
@@ -60,8 +78,15 @@ const Dashboard = () => {
   // browser tab opened after alerts already happened) ---
   useEffect(() => {
     axios.get('/api/history')
-      .then(res => setAlerts(res.data.slice(0, 100)))
+      .then(res => setAlerts(prev => mergeAlerts(prev, Array.isArray(res.data) ? res.data : [])))
       .catch(err => console.error('Failed to load alert history:', err));
+  }, []);
+
+  // Keep notification audio aligned with the saved Settings toggle.
+  useEffect(() => {
+    axios.get('/api/settings')
+      .then(res => setSoundEnabled(res.data?.sound !== false))
+      .catch(err => console.error('Failed to load alert preferences:', err));
   }, []);
 
   // --- Real system health poller (CPU/RAM/Disk via psutil) ---
@@ -116,10 +141,10 @@ const Dashboard = () => {
     const handleDisconnect = () => setIsConnected(false);
 
     const handleNewAlert = (alert) => {
-      setAlerts(prev => [alert, ...prev.slice(0, 99)]);
-      if (alert.severity === 'CRITICAL') {
+      setAlerts(prev => mergeAlerts(prev, alert));
+      if (soundEnabled && alert.severity === 'CRITICAL') {
         new Audio('/critical.mp3').play().catch(() => {});
-      } else if (alert.severity === 'HIGH') {
+      } else if (soundEnabled && alert.severity === 'HIGH') {
         new Audio('/high.mp3').play().catch(() => {});
       }
     };
@@ -134,7 +159,7 @@ const Dashboard = () => {
       socket.off('disconnect', handleDisconnect);
       socket.off('new_alert', handleNewAlert);
     };
-  }, []);
+  }, [soundEnabled]);
 
   const criticalCount = alerts.filter(a => a.severity === 'CRITICAL').length;
   const mappable = alerts.filter(a => a.location?.lat != null && a.location?.lon != null);
@@ -190,9 +215,11 @@ const Dashboard = () => {
             <MapContainer center={[20, 10]} zoom={1.5} minZoom={1.5} worldCopyJump
               style={{ height: '100%', width: '100%', background: '#0B0E14' }}>
               <TileLayer
-                url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
-                attribution='&copy; <a href="https://carto.com/attributions">CARTO</a>'
-              />
+                    url={TILE_URL}
+                    attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>, &copy; <a href="https://carto.com/attributions">CARTO</a>'
+                    subdomains="abcd"
+                    maxZoom={20}
+                  />
               {mappable.map((a, i) => (
                 <CircleMarker
                   key={`${a.src_ip}-${a.timestamp}-${i}`}

@@ -7,7 +7,7 @@ import time
 
 import numpy as np
 
-from feature_order import FEATURE_ORDER
+from sequence_builder import build_windows, build_cnn_sequences
 from ids_pipeline import RealTimeIDSPipeline
 
 

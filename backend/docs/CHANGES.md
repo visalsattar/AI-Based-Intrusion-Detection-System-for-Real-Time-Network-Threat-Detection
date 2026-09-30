@@ -100,8 +100,8 @@ better — this is reported as a negative result, not silently discarded.
 - Live sniffer's feature set (~24 of 78) is real but incomplete.
 - Only one day of CICIDS2017 (Friday DDoS) was used for training/eval;
   the full multi-day, multi-attack-type dataset was not.
-- `tests/test_*.py` are scaffolded with documented planned cases, not
-  implemented as automated pytest suites.
+- Automated tests now cover preprocessing, flow scoring, security routes, threat-intel privacy, and sequence construction.
+  Model-backed tests need the released artifacts under backend/models.
 - Live end-to-end latency (Scapy capture → React render) was never
   formally measured; the original thesis's "45–85ms" figure was found
   to have no actual measurement behind it and was removed rather than

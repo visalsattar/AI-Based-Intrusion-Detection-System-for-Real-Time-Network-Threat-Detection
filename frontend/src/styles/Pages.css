@@ -290,13 +290,24 @@
 }
 
 .setting-item select {
-  background: rgba(255, 255, 255, 0.03);
+  color-scheme: dark;
+  background-color: #111827;
   border: 1px solid var(--panel-border);
   color: var(--text);
   border-radius: 6px;
   padding: 7px 10px;
   font-size: 13px;
   font-family: inherit;
+}
+
+.setting-item select option {
+  background-color: #111827;
+  color: #e8eaed;
+}
+
+.setting-item select:focus-visible {
+  outline: 2px solid var(--data);
+  outline-offset: 2px;
 }
 
 .setting-item input[type="range"] {

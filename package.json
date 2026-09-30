@@ -1,0 +1,17 @@
+{
+  "name": "AI-Based-Intrusion-Detection-System-(IDS)-for-Real-Time-Network-Threat-Detection",
+  "version": "1.0.0",
+  "description": "AI-Based Intrusion Detection System — root convenience scripts",
+  "scripts": {
+    "start": "docker-compose up --build",
+    "stop": "docker-compose down",
+    "dev": "concurrently \"python backend/main.py\" \"npm run start --prefix frontend\""
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "concurrently": "^10.0.3"
+  }
+}

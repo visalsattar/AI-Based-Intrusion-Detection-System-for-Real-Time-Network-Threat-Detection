@@ -1,0 +1,46 @@
+{
+  "methodology": "Autoencoder and Random Forest are evaluated on the held-out flow-level test set. CNN is evaluated on 100-flow sequences constructed from that held-out test split. Autoencoder threshold is derived from benign training data only.",
+  "flow_level_test_set_size": 45149,
+  "cnn_sequence_test_set_size": 4505,
+  "cnn_window_size": 100,
+  "cnn_stride": 10,
+  "autoencoder": {
+    "accuracy": 0.7886553412035704,
+    "precision": 0.5978249165500161,
+    "recall": 0.48877542037151156,
+    "f1_score": 0.5378281507313766,
+    "roc_auc": 0.7907701595284319,
+    "threshold": 0.003154114820063114,
+    "threshold_percentile": 90,
+    "confusion_matrix": {
+      "tn": 30055,
+      "fp": 3735,
+      "fn": 5807,
+      "tp": 5552
+    }
+  },
+  "random_forest": {
+    "accuracy": 0.9974971760171876,
+    "precision": 0.9926406167864027,
+    "recall": 0.9974469583590104,
+    "f1_score": 0.995037983577043,
+    "confusion_matrix": {
+      "tn": 33706,
+      "fp": 84,
+      "fn": 29,
+      "tp": 11330
+    }
+  },
+  "cnn": {
+    "accuracy": 0.997558268590455,
+    "precision": 0.9911971830985915,
+    "recall": 0.9991126885536823,
+    "f1_score": 0.9951391957578436,
+    "confusion_matrix": {
+      "tn": 3368,
+      "fp": 10,
+      "fn": 1,
+      "tp": 1126
+    }
+  }
+}
