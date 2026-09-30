@@ -21,7 +21,7 @@ def _tcp(src, dst, sport, dport, flags, payload=b"", t=0.0, seq=0, ack=0):
     return p
 
 
-# ---------------------------------------------------------------- #2 summaries
+# - #2 summaries
 
 def test_flow_stores_summaries_not_scapy_packets():
     p = make_pipeline()
@@ -78,7 +78,7 @@ def test_wrong_ack_does_not_complete_handshake():
     assert not flow["handshake_complete"]
 
 
-# ---------------------------------------------------------------- #3 queue / worker
+# - #3 queue / worker
 
 def test_callback_only_enqueues_when_worker_mode():
     p = make_pipeline()
@@ -136,11 +136,11 @@ def test_ticker_does_not_score_when_worker_owns_flushing():
     assert p.autoencoder.rows_seen == 0
 
 
-# ---------------------------------------------------------------- iptables /32 reconciliation
+# - iptables /32 reconciliation
 
 def test_reconcile_strips_prefix_length_and_keeps_tracked_block(monkeypatch):
     p = make_pipeline()
-    ip = "203.0.113.7"
+    ip = "1.1.1.1"          # must be is_global; TEST-NET ranges are filtered
     p._blocked = {}
     import json
     with open(p._autoblock_state_path, "w") as f:

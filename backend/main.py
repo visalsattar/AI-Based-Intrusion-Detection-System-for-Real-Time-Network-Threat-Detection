@@ -4,7 +4,8 @@ AI-Based Intrusion Detection System (IDS) - Production Orchestrator.
 
 This module acts as the central control plane for the IDS. It handles:
 1. Data Preprocessing (CICIDS2017 pipeline)
-2. Hybrid AI Model Training (CNN-Autoencoder)
+2. Model training (autoencoder + random forest for live detection; CNN trained
+   for offline comparison only -- it is never loaded by the live pipeline)
 3. Real-time Packet Capture Pipeline (Scapy/IDS)
 4. Flask/Socket.IO Dashboard API & React Static File Hosting
 """
@@ -24,25 +25,40 @@ This module acts as the central control plane for the IDS. It handles:
 # Disabling greendns falls back to the normal OS resolver, which talks
 # to Docker's embedded DNS correctly.
 import os
+import sys
 os.environ['EVENTLET_NO_GREENDNS'] = 'yes'
 
-import eventlet
-eventlet.monkey_patch()
+
+def _requested_mode() -> str:
+    for i, arg in enumerate(sys.argv):
+        if arg == '--mode' and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+        if arg.startswith('--mode='):
+            return arg.split('=', 1)[1]
+    return 'dashboard'
+
+
+_CLI_MODE = _requested_mode()
+
+if _CLI_MODE == 'dashboard':
+    import eventlet
+    eventlet.monkey_patch()
 
 # 2. Standard Library Imports
 import os
-import sys
 import time
 import argparse
 import logging
 import threading
+import secrets
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 # 3. Third-Party Imports
 import numpy as np
 from flask import Flask, send_from_directory
-from flask_socketio import SocketIO
-from redis import Redis
+from flask_socketio import SocketIO, join_room
+import hmac
 from dotenv import load_dotenv
 
 # Load backend/.env (if present) BEFORE anything reads os.environ, so
@@ -61,52 +77,43 @@ FRONTEND_DIR = os.path.abspath(os.path.join(BASE_DIR, '..', 'frontend', 'build')
 from data_preprocessing import CICIDSPreprocessor
 from ai_model_development import HybridIDSModel, train_hybrid_ids_model
 from ids_pipeline import RealTimeIDSPipeline
-from redis_alert_bridge import start_redis_alert_bridge
+from redis_alert_bridge import start_redis_alert_bridge, ALERT_ROOM
 from network_utils import list_interfaces
-from routes import register_routes
+from redis_util import make_redis
+from routes import register_routes, allowed_origins, startup_auth_error
 
 # 6. Global Application Initialization
 # Initialize Flask using the absolute path to the React frontend
 app = Flask(__name__, static_folder=FRONTEND_DIR, static_url_path=None)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-key')
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+# No guessable fallback: an unset SECRET_KEY becomes a random per-process key.
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY') or secrets.token_hex(32)
+# Same allow-list the REST guard uses (IDS_ALLOWED_ORIGINS); "*" let any web page a user
+# happened to visit open a socket to the dashboard and read live alerts.
+socketio = SocketIO(
+    app,
+    cors_allowed_origins=allowed_origins(),
+    async_mode='eventlet' if _CLI_MODE == 'dashboard' else 'threading',
+)
 
 # Optional Redis connection. All alert data — real or none — flows through
 # the 'ids:alerts' stream, written by RealTimeIDSPipeline once packet
 # capture is running, and read here by both the REST API and the live
 # Socket.IO bridge below. There is no synthetic data path.
-def _connect_redis(max_attempts=5, base_delay=1.5):
-    """Connect to Redis with retry+backoff.
+def _connect_redis():
+    """Create a lazy Redis client that can connect or reconnect on use.
 
-    A single failed attempt previously disabled Redis for the entire
-    container lifetime -- but Docker's internal DNS for service names
-    (e.g. 'redis') can transiently fail to resolve right at container
-    startup, especially right after a restart, before fully settling.
-    That's a timing race, not a real outage, so it's worth a few
-    short retries before giving up.
+    redis-py opens connections when commands are issued, rather than when
+    the client is constructed. Keeping the client even if Redis is briefly
+    unavailable at dashboard startup lets later requests recover without
+    restarting the backend. REDIS_HOST/PORT/PASSWORD still must point at
+    the Redis instance used by this deployment.
     """
-    host = os.environ.get('REDIS_HOST', 'redis')
-    log = logging.getLogger("IDS-Orchestrator")
-    for attempt in range(1, max_attempts + 1):
-        try:
-            client = Redis(host=host, port=6379, decode_responses=True, socket_connect_timeout=2)
-            client.ping()
-            if attempt > 1:
-                log.info(f"Redis connected on attempt {attempt}/{max_attempts}.")
-            return client
-        except Exception as e:
-            if attempt < max_attempts:
-                delay = base_delay * attempt
-                log.warning(f"Redis connection attempt {attempt}/{max_attempts} failed "
-                            f"({host}): {e} -- retrying in {delay:.1f}s.")
-                time.sleep(delay)
-            else:
-                log.warning(f"Redis connection failed after {max_attempts} attempts "
-                            f"({host}): {e}. Continuing without Redis -- "
-                            f"history/settings/live-alerts will be unavailable "
-                            f"until the process is restarted.")
-                return None
-
+    client = make_redis()
+    host = f"{os.environ.get('REDIS_HOST', 'localhost')}:{os.environ.get('REDIS_PORT', '6379')}"
+    logging.getLogger("IDS-Orchestrator").info(
+        "Redis client configured for %s; connection will be checked on use.", host
+    )
+    return client
 redis_client = _connect_redis()
 
 # Activate API routes (Redis-aware so History/Threat-Intel read real data)
@@ -115,16 +122,29 @@ register_routes(app, redis_client)
 _bridge_lock = threading.Lock()
 _bridge_started = False
 
+
+def socket_authorized(auth, expected_token: str) -> bool:
+    """
+    Socket.IO connect auth. With IDS_API_TOKEN set, the client must send
+    io(url, {auth: {token}}). CORS only restricts browsers; without this check any
+    script could connect and read every live alert (internal IPs included).
+    With no token configured, startup_auth_error() has already refused any
+    non-loopback bind, so unauthenticated sockets are local-only.
+    """
+    if not expected_token:
+        return True
+    supplied = auth.get("token") if isinstance(auth, dict) else None
+    return isinstance(supplied, str) and hmac.compare_digest(supplied, expected_token)
+
+
 @socketio.on('connect')
-def _handle_socket_connect():
-    """
-    Starts the Redis -> Socket.IO alert bridge once, on first client
-    connection. This tails the real 'ids:alerts' stream that
-    RealTimeIDSPipeline writes to during packet capture (see
-    run_ids_capture / AUTO_CAPTURE below) and pushes each new alert to
-    every connected dashboard client live.
-    """
+def _handle_socket_connect(auth=None):
+    """Authenticate, join the alert room, and start the Redis bridge once."""
     global _bridge_started
+    if not socket_authorized(auth, os.environ.get('IDS_API_TOKEN', '')):
+        logging.getLogger("IDS-Orchestrator").warning("Rejected unauthenticated Socket.IO connection")
+        return False            # refuses the connection; bridge is never started for it
+    join_room(ALERT_ROOM)
     with _bridge_lock:
         if _bridge_started:
             return
@@ -157,11 +177,16 @@ def resolve_interface(requested: str) -> str:
     return requested or 'eth0'
 
 # 7. Enterprise-Grade Logging Configuration
+# Create logs/ before FileHandler tries to open the file — setup_environment()
+# runs later, but the handler is instantiated here at import time.
+Path(os.path.join(BASE_DIR, 'logs')).mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] [%(name)s] [%(levelname)s] - %(message)s',
     handlers=[
-        logging.FileHandler('logs/ids.log'),
+        # Rotating: the pipeline logs every scored flow at INFO; a plain FileHandler grows forever.
+        RotatingFileHandler(os.path.join(BASE_DIR, 'logs', 'ids.log'),
+                            maxBytes=5 * 1024 * 1024, backupCount=3),
         logging.StreamHandler(sys.stdout)
     ]
 )
@@ -229,7 +254,7 @@ def run_ids_capture(interface: str):
         logger.error(
             "Cannot start packet capture — trained model artifacts are missing "
             f"({model_path}, {scaler_path}). Run `python main.py --mode preprocess --dataset <csv>` "
-            "then `python main.py --mode train` first."
+            "then `python run_training.py` first (or download the release models, see README)."
         )
         return
 
@@ -238,7 +263,12 @@ def run_ids_capture(interface: str):
             model_path=model_path,
             feature_extractor_path=scaler_path,
             alert_threshold=0.85,
-            packet_batch_size=50
+            packet_batch_size=50,
+            # The CICIDS2017 authors report a 120 s flow timeout. A shorter idle timeout
+            # chops long-lived connections into fragments the models never saw in training,
+            # so 15 s trades detection latency for a train/serve mismatch. Measure before
+            # lowering it further.
+            flow_idle_timeout=float(os.environ.get('FLOW_IDLE_TIMEOUT', '15')),
         )
         ids.start_capture(interface=resolved)
     except PermissionError as e:
@@ -280,9 +310,23 @@ def run_production_dashboard():
             "or run `python main.py --mode ids --interface <name>` as a separate process."
         )
 
+    # Loopback by default. The Docker image sets IDS_BIND=0.0.0.0 and compose publishes the
+    # port on 127.0.0.1 only; opening it to the LAN should be a deliberate choice.
+    bind = os.environ.get('IDS_BIND', '127.0.0.1')
+    err = startup_auth_error(
+        bind,
+        os.environ.get('IDS_API_TOKEN', ''),
+        os.environ.get('IDS_ALLOW_UNAUTHENTICATED', 'false').strip().lower() in {'1', 'true', 'yes'},
+    )
+    if err:
+        logger.critical(err)
+        sys.exit(1)
+    if not os.environ.get('IDS_API_TOKEN'):
+        logger.warning("IDS_API_TOKEN is unset: mutating API routes are unauthenticated. "
+                       "Acceptable only while the port is reachable from this machine alone.")
     socketio.run(
-        app, 
-        host='0.0.0.0', 
+        app,
+        host=bind,
         port=5000, 
         debug=False, 
         allow_unsafe_werkzeug=True

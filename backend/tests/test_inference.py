@@ -21,6 +21,7 @@ import pytest
 from scapy.all import IP, TCP
 
 import ids_pipeline
+from feature_order import FEATURE_ORDER
 from ids_pipeline import RealTimeIDSPipeline
 
 BACKEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -42,7 +43,7 @@ class FakeRedis:
     def get(self, key):
         return None
 
-    def xadd(self, stream, mapping):
+    def xadd(self, stream, mapping, **kw):   # the pipeline passes maxlen=/approximate=
         self.added.append((stream, mapping))
 
     def alerts(self):
@@ -58,6 +59,10 @@ def pipeline():
         packet_batch_size=1000,  # high, so manual flows never auto-trigger a batch
     )
     return ids
+
+@pytest.fixture(autouse=True)
+def _reset_alert_cooldown(pipeline):
+    pipeline._last_alert.clear()
 
 
 def _make_flow(pipeline, src="10.0.0.5", dst="10.0.0.9", sport=44444, dport=80, n=4):
@@ -104,6 +109,17 @@ def test_feature_vector_is_78_and_scaler_aligned(pipeline):
     assert features.shape == (78,), f"expected 78 features, got {features.shape}"
     assert features.shape[0] == pipeline.feature_scaler.n_features_in_
     assert np.isfinite(features).all(), "feature vector contains NaN/Inf"
+
+
+def test_scaler_feature_names_match_extractor_order(pipeline):
+    """
+    The fitted scaler's column order must equal the order _extract_flow_features emits.
+    A shape check cannot catch a column shift (shape stays (78,)); this can. If it fails, either
+    tests/feature_order.py has a typo against the real CICIDS header, or the extractor drifted.
+    """
+    names = [str(n) for n in pipeline.feature_scaler.feature_names_in_]
+    diffs = [(i, a, b) for i, (a, b) in enumerate(zip(names, FEATURE_ORDER)) if a != b]
+    assert names == FEATURE_ORDER, f"{len(diffs)} mismatches, first: {diffs[:5]}"
 
 
 def test_idle_flows_are_evicted(pipeline):
@@ -188,6 +204,7 @@ def test_alert_gating_below_threshold_is_silent(pipeline):
 def test_alert_fires_above_threshold(pipeline):
     """A large reconstruction error must raise exactly one alert."""
     pipeline.redis_client = FakeRedis()
+    pipeline.ae_only_alerting_validated = True
     flow_key = _make_flow(pipeline)
 
     pipeline._process_prediction(flow_key, recon_error=1.0, rf_attack_prob=None)
@@ -253,3 +270,20 @@ def test_rf_override_confirms_known_attack(pipeline):
     assert len(alerts) == 1, "RF override failed to fire on a known-attack pattern"
     assert "random forest override" in alerts[0]["detection_source"]
     assert alerts[0]["anomaly_score"] == pytest.approx(0.95, abs=1e-6)
+
+def test_cooldown_suppresses_duplicate_alerts(pipeline):
+    pipeline.redis_client = FakeRedis()
+    pipeline.ae_only_alerting_validated = True
+    key = _make_flow(pipeline)
+    pipeline._process_prediction(key, recon_error=1.0, rf_attack_prob=None)
+    pipeline._process_prediction(key, recon_error=1.0, rf_attack_prob=None)
+    assert len(pipeline.redis_client.alerts()) == 1
+
+def test_done_flow_is_scored_once_and_removed(pipeline):
+    pipeline.redis_client = FakeRedis()
+    key = _make_flow(pipeline)
+    pipeline.flow_tracker[key]['done'] = True
+    pipeline._done.add(key)   # what _ingest() does when it sees FIN/RST
+    pipeline.packet_buffer.append((key, None))
+    pipeline._inference_batch()
+    assert key not in pipeline.flow_tracker

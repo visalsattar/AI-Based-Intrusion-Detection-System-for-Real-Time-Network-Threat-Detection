@@ -6,7 +6,13 @@ data_preprocessing`), matching how main.py / model_evaluation.py insert
 """
 import os
 import sys
+import pytest
 
 SRC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src"))
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
+
+@pytest.fixture(autouse=True)
+def _isolate_evidence(tmp_path, monkeypatch):
+    """Tests must never write into the real backend/evidence/ folder."""
+    monkeypatch.setenv("IDS_EVIDENCE_DIR", str(tmp_path))
