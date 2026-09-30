@@ -79,3 +79,7 @@ backend/BasicFlow.java
 coverage.txt
 *.bak
 autoblock_state*.json
+
+# never commit local capture config or evidence output
+backend/config/whitelist.json
+backend/evidence/

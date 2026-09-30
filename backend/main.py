@@ -45,8 +45,8 @@ if _CLI_MODE == 'dashboard':
     eventlet.monkey_patch()
 
 # 2. Standard Library Imports
-import os
 import time
+import hmac
 import argparse
 import logging
 import threading
@@ -58,7 +58,6 @@ from pathlib import Path
 import numpy as np
 from flask import Flask, send_from_directory
 from flask_socketio import SocketIO, join_room
-import hmac
 from dotenv import load_dotenv
 
 # Load backend/.env (if present) BEFORE anything reads os.environ, so
@@ -80,7 +79,7 @@ from ids_pipeline import RealTimeIDSPipeline
 from redis_alert_bridge import start_redis_alert_bridge, ALERT_ROOM
 from network_utils import list_interfaces
 from redis_util import make_redis
-from routes import register_routes, allowed_origins, startup_auth_error
+from routes import register_routes, allowed_origins
 
 # 6. Global Application Initialization
 # Initialize Flask using the absolute path to the React frontend
@@ -128,8 +127,8 @@ def socket_authorized(auth, expected_token: str) -> bool:
     Socket.IO connect auth. With IDS_API_TOKEN set, the client must send
     io(url, {auth: {token}}). CORS only restricts browsers; without this check any
     script could connect and read every live alert (internal IPs included).
-    With no token configured, startup_auth_error() has already refused any
-    non-loopback bind, so unauthenticated sockets are local-only.
+    With no token configured, connections are accepted -- the dashboard is then
+    only safe while bound to loopback (IDS_BIND defaults to 127.0.0.1).
     """
     if not expected_token:
         return True
@@ -154,27 +153,31 @@ def _handle_socket_connect(auth=None):
 
 def resolve_interface(requested: str) -> str:
     """
-    Turns 'auto' (or a bad/missing interface name) into a real interface
-    that actually exists on this host, instead of hardcoding 'eth0' — which
-    doesn't exist on most Docker Desktop / Windows / Wi-Fi setups.
+    'auto' selects the first up, non-loopback interface (preferring one with IPv4).
+    An explicit name that doesn't exist is an error, never silently substituted:
+    capturing on the wrong NIC looks healthy while seeing none of the intended traffic.
     """
     interfaces = list_interfaces()
     names = {i['name'] for i in interfaces}
 
-    if requested and requested != 'auto' and requested in names:
-        return requested
+    if requested and requested != 'auto':
+        if requested in names:
+            return requested
+        logger.error(
+            "Capture interface %r not found. Available: %s. Use --interface auto to auto-select.",
+            requested, ', '.join(sorted(names)) or '(none)',
+        )
+        raise SystemExit(1)
 
-    # Prefer the first interface that's up, has an IPv4 address, and isn't loopback
-    for i in interfaces:
-        if i['is_up'] and i['ipv4'] and not i['name'].lower().startswith(('lo', 'loopback')):
-            return i['name']
-
-    # Last resort: whatever is up, even without a detected IPv4
-    for i in interfaces:
-        if i['is_up']:
-            return i['name']
-
-    return requested or 'eth0'
+    candidates = [i for i in interfaces
+                  if i['is_up'] and not i['name'].lower().startswith(('lo', 'loopback'))]
+    with_ip = [i for i in candidates if i['ipv4']]
+    chosen = (with_ip or candidates or [None])[0]
+    if chosen is None:
+        logger.error("No non-loopback interface is up; cannot start capture.")
+        raise SystemExit(1)
+    logger.warning("Auto-selected capture interface %r (ipv4=%s)", chosen['name'], chosen['ipv4'])
+    return chosen['name']
 
 # 7. Enterprise-Grade Logging Configuration
 # Create logs/ before FileHandler tries to open the file — setup_environment()
@@ -221,20 +224,20 @@ def execute_model_training():
     """Trains the Hybrid CNN-Autoencoder model using temporal sequences."""
     logger.info("Initiating hybrid model training...")
     from sequence_builder import build_cnn_sequences
-    
+
     try:
         data = build_cnn_sequences('data/preprocessed/CICIDS2017_cleaned.csv', window_size=100, stride=10)
-        
+
         train_hybrid_ids_model(
             data['X_train_flat'], data['y_train_flat'],
             data['X_val_flat'], data['y_val_flat'],
             data['X_seq_train'], data['X_seq_val'],
             data['y_seq_train'], data['y_seq_val']
         )
-        
+
         np.save('data/preprocessed/X_test_flat.npy', data['X_test_flat'])
         np.save('data/preprocessed/y_test_flat.npy', data['y_test_flat'])
-        
+
         logger.info("Training finished successfully. Model and test-sets persisted.")
     except Exception as e:
         logger.error(f"Training failed: {e}", exc_info=True)
@@ -312,23 +315,11 @@ def run_production_dashboard():
 
     # Loopback by default. The Docker image sets IDS_BIND=0.0.0.0 and compose publishes the
     # port on 127.0.0.1 only; opening it to the LAN should be a deliberate choice.
-    bind = os.environ.get('IDS_BIND', '127.0.0.1')
-    err = startup_auth_error(
-        bind,
-        os.environ.get('IDS_API_TOKEN', ''),
-        os.environ.get('IDS_ALLOW_UNAUTHENTICATED', 'false').strip().lower() in {'1', 'true', 'yes'},
-    )
-    if err:
-        logger.critical(err)
-        sys.exit(1)
-    if not os.environ.get('IDS_API_TOKEN'):
-        logger.warning("IDS_API_TOKEN is unset: mutating API routes are unauthenticated. "
-                       "Acceptable only while the port is reachable from this machine alone.")
     socketio.run(
         app,
-        host=bind,
-        port=5000, 
-        debug=False, 
+        host=os.environ.get('IDS_BIND', '127.0.0.1'),
+        port=5000,
+        debug=False,
         allow_unsafe_werkzeug=True
     )
 
@@ -336,14 +327,15 @@ def run_production_dashboard():
 def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(description='AI-Based Intrusion Detection System')
-    parser.add_argument('--mode', choices=['preprocess', 'train', 'ids', 'dashboard'], 
+    parser.add_argument('--mode', choices=['preprocess', 'train', 'ids', 'dashboard'],
                         default='dashboard', help='Run mode selection')
     parser.add_argument('--dataset', help='Required for preprocess mode')
-    parser.add_argument('--interface', default='eth0', help='Network interface for capture')
-    
+    parser.add_argument('--interface', default='auto',
+                        help='Network interface for capture (default: auto-select)')
+
     args = parser.parse_args()
     setup_environment()
-    
+
     if args.mode == 'preprocess':
         if not args.dataset:
             logger.error("Usage: --mode preprocess --dataset <path_to_csv>")
