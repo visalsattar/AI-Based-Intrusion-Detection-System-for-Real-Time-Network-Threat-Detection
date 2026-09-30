@@ -53,10 +53,11 @@ import threading
 import secrets
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from urllib.parse import urlparse
 
 # 3. Third-Party Imports
 import numpy as np
-from flask import Flask, send_from_directory
+from flask import Flask, request, send_from_directory
 from flask_socketio import SocketIO, join_room
 from dotenv import load_dotenv
 
@@ -72,14 +73,20 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(BASE_DIR, 'src'))
 FRONTEND_DIR = os.path.abspath(os.path.join(BASE_DIR, '..', 'frontend', 'build'))
 
-# 5. Local Application Imports
+# 5. Local Application Imports (must stay AFTER the src/ sys.path insert above)
 from data_preprocessing import CICIDSPreprocessor
 from ai_model_development import HybridIDSModel, train_hybrid_ids_model
 from ids_pipeline import RealTimeIDSPipeline
 from redis_alert_bridge import start_redis_alert_bridge, ALERT_ROOM
 from network_utils import list_interfaces
 from redis_util import make_redis
-from routes import migrate_legacy_settings_until_done, register_routes, allowed_origins, enforce_startup_auth
+from routes import (
+    allowed_hosts,
+    allowed_origins,
+    enforce_startup_auth,
+    migrate_legacy_settings_until_done,
+    register_routes,
+)
 
 # 6. Global Application Initialization
 # Initialize Flask using the absolute path to the React frontend
@@ -138,10 +145,16 @@ def socket_authorized(auth, expected_token: str) -> bool:
 
 @socketio.on('connect')
 def _handle_socket_connect(auth=None):
-    """Authenticate, join the alert room, and start the Redis bridge once."""
+    """Check Host (DNS-rebinding defence, in addition to Engine.IO's Origin check),
+    authenticate, join the alert room, and start the Redis bridge once."""
     global _bridge_started
+    log = logging.getLogger("IDS-Orchestrator")
+    hostname = urlparse("//" + (request.host or "")).hostname
+    if not hostname or hostname.lower() not in allowed_hosts():
+        log.warning("Rejected Socket.IO connection: Host %r not allowed", request.host)
+        return False
     if not socket_authorized(auth, os.environ.get('IDS_API_TOKEN', '')):
-        logging.getLogger("IDS-Orchestrator").warning("Rejected unauthenticated Socket.IO connection")
+        log.warning("Rejected unauthenticated Socket.IO connection")
         return False            # refuses the connection; bridge is never started for it
     join_room(ALERT_ROOM)
     with _bridge_lock:
@@ -221,8 +234,10 @@ def execute_preprocessing(dataset_path: str):
 
 
 def execute_model_training():
-    """Trains the Hybrid CNN-Autoencoder model using temporal sequences."""
-    logger.info("Initiating hybrid model training...")
+    """Trains the models via train_hybrid_ids_model: the flat-feature models used by the
+    live pipeline, plus the CNN on temporal sequences for OFFLINE comparison only (the
+    live pipeline never loads the CNN). Persists the flat test split for evaluation."""
+    logger.info("Initiating model training...")
     from sequence_builder import build_cnn_sequences
 
     try:

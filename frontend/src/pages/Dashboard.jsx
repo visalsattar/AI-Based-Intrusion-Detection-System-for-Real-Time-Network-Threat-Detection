@@ -64,6 +64,14 @@ const mergeAlerts = (current, incoming) => {
     .slice(0, 100);
 };
 
+// /api/health: 200 = all good, 503 = backend up but Redis down (still a valid report),
+// no response = backend unreachable (the last numbers are stale and must not be shown as live).
+const healthNote = (h) => {
+  if (h.status === 'unreachable') return 'Backend unreachable';
+  if (h.status === 'degraded' || h.redis === 'disconnected') return 'Redis down — alerts not stored';
+  return 'System Health';
+};
+
 const Dashboard = () => {
   const [sysHealth, setSysHealth] = useState({ cpu: 0, ram: 0, disk: 0 });
   const [alerts, setAlerts] = useState([]);
@@ -93,9 +101,14 @@ const Dashboard = () => {
   useEffect(() => {
     const fetchHealth = async () => {
       try {
-        const res = await axios.get('/api/health');
+        // 503 = backend up, Redis down: still a valid health report, not an error
+        const res = await axios.get('/api/health', {
+          validateStatus: (s) => s === 200 || s === 503,
+        });
         setSysHealth(res.data);
       } catch (error) {
+        // Backend itself unreachable: don't keep showing the last good numbers as live
+        setSysHealth((prev) => ({ ...(prev || {}), status: 'unreachable', redis: 'unknown' }));
         console.error("Failed to fetch system health metrics.", error);
       }
     };
@@ -163,6 +176,8 @@ const Dashboard = () => {
 
   const criticalCount = alerts.filter(a => a.severity === 'CRITICAL').length;
   const mappable = alerts.filter(a => a.location?.lat != null && a.location?.lon != null);
+  const healthStale = sysHealth.status === 'unreachable';
+  const healthLabel = healthNote(sysHealth);
 
   const handleExportLogs = () => downloadJSON(alerts, `ids-alerts-${Date.now()}.json`);
 
@@ -194,16 +209,16 @@ const Dashboard = () => {
           <div className="value">{criticalCount}</div>
         </div>
 
-        <div className={`metric-card ${sysHealth.cpu > 80 ? 'red' : ''}`}>
+        <div className={`metric-card ${!healthStale && sysHealth.cpu > 80 ? 'red' : ''}`}>
           <h3>CPU Load</h3>
-          <div className="value">{sysHealth.cpu ?? 0}%</div>
-          <span className="trend">System Health</span>
+          <div className="value">{healthStale ? '—' : `${sysHealth.cpu ?? 0}%`}</div>
+          <span className="trend">{healthLabel}</span>
         </div>
 
-        <div className={`metric-card ${sysHealth.ram > 80 ? 'orange' : ''}`}>
+        <div className={`metric-card ${!healthStale && sysHealth.ram > 80 ? 'orange' : ''}`}>
           <h3>RAM Usage</h3>
-          <div className="value">{sysHealth.ram ?? 0}%</div>
-          <span className="trend">System Health</span>
+          <div className="value">{healthStale ? '—' : `${sysHealth.ram ?? 0}%`}</div>
+          <span className="trend">{healthLabel}</span>
         </div>
       </div>
 
