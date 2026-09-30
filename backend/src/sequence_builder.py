@@ -1,87 +1,118 @@
 """
-Sequence construction for the CNN component of the hybrid IDS.
+Sequence construction for the CNN component (OFFLINE architecture
+comparison only -- not part of the live RF+AE detection pipeline).
 
-METHODOLOGICAL NOTE (this must be stated in Thesis Chapter 6):
-This CICIDS2017 distribution (the 78-feature ML-ready CSV) contains no
-Timestamp, Flow ID, or IP address columns. True chronological ordering
-of flows is therefore not recoverable from this file. As a documented
-limitation, this module uses CSV ROW ORDER as a proxy for temporal
-order: CICFlowMeter (the tool used to generate CICIDS2017) writes flows
-to disk approximately in the order they are finalized during capture,
-which correlates with -- but is not identical to -- true capture-time
-order. This should be reported as a limitation, not presented as exact
-chronological ground truth.
+METHODOLOGICAL NOTES (state in Thesis Chapter 6):
 
-LEAKAGE-PREVENTION DESIGN (important, verified, do not "simplify"):
-Flat rows are split into train/val/test FIRST, preserving row order
-within each split. Sliding windows are then built INDEPENDENTLY within
-each split. This guarantees no window in train can share any rows with
-a window in test/val.
+1. Temporal proxy. This CICIDS2017 distribution (78-feature ML-ready CSV)
+   has no Timestamp, Flow ID, or IP columns. CSV ROW ORDER is used as a
+   proxy for temporal order. CICFlowMeter writes flows roughly in the
+   order they are finalized, which correlates with -- but is not
+   identical to -- capture time. Report as a limitation.
 
-The alternative approach -- building all overlapping windows first,
-then randomly splitting the resulting windows -- was tried, tested, and
-found to leak: with stride < window_size, adjacent windows share up to
-(window_size - stride) rows. A direct test showed 90% row-overlap
-between adjacent windows at window_size=100, stride=10. That approach
-was rejected and is not used here.
+2. Day-file concatenation. If the CSV was built by concatenating per-day
+   files, a row-order split is effectively a day-order split: the test
+   set may be dominated by the last day's attack classes, and windows
+   can straddle day boundaries. Report per-split class distributions.
 
-Each window's label is the label of its LAST row (i.e. "given the
-preceding window_size-1 flows of context, is the most recent flow an
-attack"). This is a deliberate choice, not the only valid one -- "any
-attack in the window" is an alternative methodology with different
-implications -- so this choice and its rationale should be stated
-explicitly in Chapter 6.
+3. Leakage prevention. Flat rows are split into train/val/test FIRST
+   (contiguous, no shuffle), then windows are built independently within
+   each split, so no row appears in more than one split. Building all
+   overlapping windows first and then randomly splitting them leaks
+   (up to window_size - stride shared rows between adjacent windows) and
+   is deliberately not used. Verified by
+   tests/test_sequence_builder.py::test_no_row_sharing_across_splits.
+
+4. Labeling. Each window's label is the label of its LAST row ("given the
+   preceding window_size-1 flows, is the most recent flow an attack").
+   "Any attack in window" is a valid alternative with different
+   implications.
+
+5. Evaluation subset. Only rows at positions window_size-1 + k*stride
+   within each split are scored. The first window_size-1 rows of each
+   split, and trailing rows that do not complete a stride, are never
+   scored. CNN metrics are therefore NOT computed on the same flows as
+   RF/AE metrics. Use last_row_indices() to evaluate RF/AE on the
+   identical subset before comparing numbers.
 """
 import numpy as np
 import pandas as pd
+from numpy.lib.stride_tricks import sliding_window_view
+
+
+def _validate_labels(y: np.ndarray) -> np.ndarray:
+    if y.dtype.kind not in "iub":
+        if y.dtype.kind == "f" and np.all(np.equal(np.mod(y, 1), 0)):
+            y = y.astype(np.int64)
+        else:
+            raise ValueError(
+                f"Labels must be integer-encoded (got dtype {y.dtype}). "
+                f"Encode string labels before building sequences."
+            )
+    return y.astype(np.int64, copy=False)
+
+
+def last_row_indices(n_samples: int, window_size: int = 100,
+                     stride: int = 10) -> np.ndarray:
+    """Flat-row indices (within a split) that the CNN windows are scored on."""
+    if n_samples < window_size:
+        return np.empty(0, dtype=np.int64)
+    return np.arange(window_size - 1, n_samples, stride, dtype=np.int64)
 
 
 def build_windows(X: np.ndarray, y: np.ndarray,
-                   window_size: int = 100, stride: int = 10):
+                  window_size: int = 100, stride: int = 10):
     """
-    Slide a window across X (assumed to already be in correct row
-    order for this split -- do not shuffle before calling). Label of
-    each window = label of its last row.
+    Slide a window across X (must already be in row order for this split;
+    do not shuffle before calling). Label of each window = label of its
+    last row.
+
+    Returns a READ-ONLY zero-copy view for X_seq, shape
+    (n_windows, window_size, n_features). Call np.ascontiguousarray() on
+    a batch if a framework needs contiguous memory.
     """
-    n_samples, n_features = X.shape
+    if window_size < 1 or stride < 1:
+        raise ValueError("window_size and stride must be >= 1.")
+    n_samples = X.shape[0]
     if n_samples < window_size:
         raise ValueError(
             f"Cannot build sequences of length {window_size} from only "
             f"{n_samples} samples. Reduce window_size, increase data, "
             f"or this split is too small."
         )
+    if len(y) != n_samples:
+        raise ValueError(f"X has {n_samples} rows but y has {len(y)}.")
 
-    starts = list(range(0, n_samples - window_size + 1, stride))
-    X_seq = np.empty((len(starts), window_size, n_features), dtype=np.float32)
-    y_seq = np.empty(len(starts), dtype=np.int64)
+    X = np.asarray(X, dtype=np.float32)
+    y = _validate_labels(np.asarray(y))
 
-    for i, s in enumerate(starts):
-        X_seq[i] = X[s:s + window_size]
-        y_seq[i] = y[s + window_size - 1]   # label of LAST row in window
+    # sliding_window_view -> (n_windows_full, n_features, window_size)
+    X_seq = sliding_window_view(X, window_size, axis=0)[::stride]
+    X_seq = X_seq.transpose(0, 2, 1)
+    y_seq = y[last_row_indices(n_samples, window_size, stride)]
 
+    assert X_seq.shape[0] == y_seq.shape[0]
     return X_seq, y_seq
 
 
 def build_cnn_sequences(preprocessed_csv_path: str,
-                         window_size: int = 100, stride: int = 10,
-                         test_size: float = 0.2, val_size: float = 0.125,
-                         min_rows_per_split: int = 200):
+                        window_size: int = 100, stride: int = 10,
+                        test_size: float = 0.2, val_size: float = 0.125,
+                        min_rows_per_split: int = 200):
     """
-    Full pipeline: load preprocessed flat CSV -> split flat rows
-    (no shuffle, preserving row order) -> build windows independently
-    within each split.
+    Load preprocessed flat CSV -> split flat rows contiguously (no
+    shuffle) -> build windows independently within each split.
 
-    Returns flat splits too, so the autoencoder/RF reuse the exact
-    same underlying row split as the CNN. The evaluation units differ:
-    RF/AE operate on individual flows, while CNN operates on 100-flow
-    sequences.
+    Also returns the flat splits so RF/AE reuse the identical row split,
+    and the per-split last-row indices so RF/AE can be scored on the
+    same flows as the CNN.
     """
     df = pd.read_csv(preprocessed_csv_path)
     if 'Label' not in df.columns:
         raise ValueError("Expected a 'Label' column in preprocessed data.")
 
     X_flat = df.drop(columns=['Label']).values.astype(np.float32)
-    y_flat = df['Label'].values
+    y_flat = _validate_labels(df['Label'].values)
     n = len(X_flat)
 
     n_test = int(n * test_size)
@@ -89,103 +120,27 @@ def build_cnn_sequences(preprocessed_csv_path: str,
     n_val = int(n_trainval * val_size)
     n_train = n_trainval - n_val
 
-    if min(n_train, n_val, n_test) < min_rows_per_split:
+    if min(n_train, n_val, n_test) < max(min_rows_per_split, window_size):
         raise ValueError(
             f"One or more splits too small for reliable windowing: "
             f"train={n_train}, val={n_val}, test={n_test}. "
-            f"Need at least {min_rows_per_split} rows per split."
+            f"Need at least {max(min_rows_per_split, window_size)} rows per split."
         )
 
-    # No shuffle: row order must be preserved within each split for
-    # "row order as temporal proxy" to mean anything.
-    X_train_flat, y_train_flat = X_flat[:n_train], y_flat[:n_train]
-    X_val_flat, y_val_flat = (X_flat[n_train:n_train + n_val],
-                                y_flat[n_train:n_train + n_val])
-    X_test_flat, y_test_flat = (X_flat[n_train + n_val:],
-                                  y_flat[n_train + n_val:])
-
-    X_seq_train, y_seq_train = build_windows(X_train_flat, y_train_flat, window_size, stride)
-    X_seq_val, y_seq_val = build_windows(X_val_flat, y_val_flat, window_size, stride)
-    X_seq_test, y_seq_test = build_windows(X_test_flat, y_test_flat, window_size, stride)
-
-    return {
-        'X_seq_train': X_seq_train, 'y_seq_train': y_seq_train,
-        'X_seq_val': X_seq_val, 'y_seq_val': y_seq_val,
-        'X_seq_test': X_seq_test, 'y_seq_test': y_seq_test,
-        'X_train_flat': X_train_flat, 'y_train_flat': y_train_flat,
-        'X_val_flat': X_val_flat, 'y_val_flat': y_val_flat,
-        'X_test_flat': X_test_flat, 'y_test_flat': y_test_flat,
+    splits = {
+        'train': (0, n_train),
+        'val': (n_train, n_train + n_val),
+        'test': (n_train + n_val, n),
     }
 
+    out = {}
+    for name, (a, b) in splits.items():
+        Xs, ys = X_flat[a:b], y_flat[a:b]
+        X_seq, y_seq = build_windows(Xs, ys, window_size, stride)
+        out[f'X_seq_{name}'] = X_seq
+        out[f'y_seq_{name}'] = y_seq
+        out[f'X_{name}_flat'] = Xs
+        out[f'y_{name}_flat'] = ys
+        out[f'eval_idx_{name}'] = last_row_indices(b - a, window_size, stride)
 
-def _verify_no_window_overlap_across_splits(X_seq_a, X_seq_b, sample_check=50):
-    """
-    Self-test helper: confirm no window in split A shares all its rows
-    with any window in split B. Used by the test suite below, and safe
-    to call manually if you want to re-verify after changing parameters.
-    """
-    if len(X_seq_a) == 0 or len(X_seq_b) == 0:
-        return True
-    a_flat_sample = X_seq_a[:sample_check].reshape(min(sample_check, len(X_seq_a)), -1)
-    b_flat_sample = X_seq_b[:sample_check].reshape(min(sample_check, len(X_seq_b)), -1)
-    for a_row in a_flat_sample:
-        for b_row in b_flat_sample:
-            if np.array_equal(a_row, b_row):
-                return False
-    return True
-
-
-if __name__ == "__main__":
-    print("Running self-tests on sequence construction...")
-
-    # Test 1: basic shape + ordering correctness
-    X_test = np.arange(1000 * 5).reshape(1000, 5).astype(np.float32)
-    y_test = np.zeros(1000, dtype=np.int64)
-    y_test[500:510] = 1
-
-    X_seq, y_seq = build_windows(X_test, y_test, window_size=100, stride=10)
-    expected_n = (1000 - 100) // 10 + 1
-    assert X_seq.shape == (expected_n, 100, 5), f"Shape mismatch: {X_seq.shape}"
-    print(f"  [PASS] Shape correct: {X_seq.shape}")
-
-    assert np.array_equal(X_seq[0], X_test[0:100]), "Window 0 ordering broken"
-    print("  [PASS] Window 0 matches rows 0-99 exactly, in order")
-
-    # Test 2: last-row labeling is correct
-    # window starting at row 410 covers rows 410-509, last row = 509 (attack)
-    idx_410 = 41  # start = 41*10 = 410
-    assert y_seq[idx_410] == 1, "Window ending in attack row not labeled attack"
-    assert y_seq[0] == 0, "All-benign window incorrectly labeled attack"
-    print("  [PASS] Last-row label assignment correct")
-
-    # Test 3: insufficient data raises cleanly
-    try:
-        build_windows(np.zeros((50, 5)), np.zeros(50), window_size=100)
-        print("  [FAIL] Should have raised ValueError")
-    except ValueError:
-        print("  [PASS] Raises ValueError when n_samples < window_size")
-
-    # Test 4: THE LEAKAGE TEST -- this is the one that matters most.
-    # Build via the full split-first pipeline on synthetic data saved
-    # to a temp CSV, then verify zero row-sharing between train and
-    # test windows.
-    import tempfile, os
-    tmp_df = pd.DataFrame(
-        np.random.rand(3000, 6), columns=[f'f{i}' for i in range(5)] + ['Label']
-    )
-    tmp_df['Label'] = (tmp_df['Label'] > 0.5).astype(int)
-    with tempfile.NamedTemporaryFile(suffix='.csv', delete=False) as tmp:
-        tmp_df.to_csv(tmp.name, index=False)
-        tmp_path = tmp.name
-
-    result = build_cnn_sequences(tmp_path, window_size=50, stride=5,
-                                   min_rows_per_split=100)
-    no_leak = _verify_no_window_overlap_across_splits(
-        result['X_seq_train'], result['X_seq_test']
-    )
-    assert no_leak, "LEAKAGE DETECTED between train and test windows!"
-    print("  [PASS] No row-overlap between train and test windows "
-          "(leakage check, sampled)")
-    os.unlink(tmp_path)
-
-    print("\nAll self-tests passed. Safe to use on real data.")
+    return out
