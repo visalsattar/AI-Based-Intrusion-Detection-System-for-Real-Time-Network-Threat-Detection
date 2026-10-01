@@ -301,13 +301,20 @@ const Settings = () => {
           <h3><Info size={13} style={{ marginRight: 6, verticalAlign: '-2px' }} />System Information</h3>
           <div className="settings-grid" style={{ gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
             <div className="summary-card">
-              <span className="label">Autoencoder accuracy (offline)</span>
-              <span className={`value ${modelStatus?.status === 'ready' ? 'ok' : 'warn'}`} style={{ fontSize: modelStatus?.status === 'ready' ? 20 : 13 }}>
+              <span className="label">Detection model</span>
+              {/* One caption per backend status (system_status.get_model_status). No accuracy
+                  figure: the backend deliberately does not send one. */}
+              <span className={`value ${modelStatus?.status === 'ready' ? 'ok' : 'warn'}`} style={{ fontSize: 13 }}
+                    title={modelStatus?.message || ''}>
                 {modelStatus?.status === 'ready'
-                  ? (modelStatus.accuracy != null ? `${(modelStatus.accuracy * 100).toFixed(1)}%` : 'Calibrated')
-                  : modelStatus?.status === 'uncalibrated'
-                    ? 'Uncalibrated'
-                    : 'Not trained'}
+                  ? (modelStatus.detection_mode === 'ae_only' ? 'Ready (AE only, validated)' : 'Ready (ensemble)')
+                  : modelStatus?.status === 'alerts_suppressed'
+                    ? 'RF missing: alerts off'
+                    : modelStatus?.status === 'uncalibrated'
+                      ? 'Uncalibrated'
+                      : modelStatus?.status === 'not_trained'
+                        ? 'Not trained'
+                        : 'Unknown'}
               </span>
             </div>
             <div className="summary-card">
