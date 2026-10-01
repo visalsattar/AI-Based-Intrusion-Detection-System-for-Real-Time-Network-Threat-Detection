@@ -5,7 +5,10 @@ React (Create React App) dashboard for the AI-Based IDS: live alerts, alert hist
 ## Setup
 
 ```bash
+cd frontend
 npm install
+```
+```bash
 npm start
 ```
 
