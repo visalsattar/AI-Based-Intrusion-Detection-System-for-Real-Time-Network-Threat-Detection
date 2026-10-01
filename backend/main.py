@@ -288,7 +288,11 @@ def run_ids_capture(interface: str):
             model_path=model_path,
             feature_extractor_path=scaler_path,
             alert_threshold=0.85,
-            packet_batch_size=50,
+            # Scoring runs per batch; each batch pays fixed AE/RF call overhead. Measured
+            # 2 Oct 2026 (real models, synthetic flood): 50 -> 576 pkt/s, 500 -> 4,789,
+            # 2000 -> 10,640. At 50, a ~2,000 pkt/s flood overflowed the queue (85% dropped).
+            # batch_interval (2 s) still bounds latency when traffic is light.
+            packet_batch_size=1000,
             # The CICIDS2017 authors report a 120 s flow timeout. A shorter idle timeout
             # chops long-lived connections into fragments the models never saw in training,
             # so 15 s trades detection latency for a train/serve mismatch. Measure before

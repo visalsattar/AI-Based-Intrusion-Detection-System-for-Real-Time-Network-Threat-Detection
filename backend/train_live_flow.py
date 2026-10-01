@@ -52,8 +52,9 @@ def preprocess(frame, scaler):
 
 def label(frame, attacker_ip, target_port):
     """1 = attacker -> target port; 0 = flows not involving the attacker; None = ambiguous (dropped)."""
-    attack = (frame.src_ip == attacker_ip) & (frame.dst_port == target_port)
-    involves = (frame.src_ip == attacker_ip) | (frame.dst_ip == attacker_ip)
+    ips = [attacker_ip] if isinstance(attacker_ip, str) else list(attacker_ip)
+    attack = frame.src_ip.isin(ips) & (frame.dst_port == target_port)
+    involves = frame.src_ip.isin(ips) | frame.dst_ip.isin(ips)
     y = pd.Series(np.where(attack, 1, 0), index=frame.index)
     return y[attack | ~involves]
 
@@ -83,7 +84,8 @@ def main(argv=None):
     ap.add_argument("--attack", nargs="*", default=[], help="captures containing labelled attack flows")
     ap.add_argument("--benign", nargs="*", default=[], help="captures of benign-only traffic")
     ap.add_argument("--evaluate", nargs="*", default=[], help="NEW capture(s) to score with a trained model")
-    ap.add_argument("--attacker-ip", required=True)
+    ap.add_argument("--attacker-ip", required=True, nargs="+",
+                    help="one or more attacker IPs (e.g. a LAN device and a WSL VM)")
     ap.add_argument("--target-port", type=int, required=True)
     ap.add_argument("--scaler", default="models/feature_scaler.pkl")
     ap.add_argument("--out", default="models/live_flow_v1")
@@ -109,7 +111,7 @@ def main(argv=None):
             y=label(d, args.attacker_ip, args.target_port), source=f))
     for f in args.benign:
         d = pd.read_csv(f)
-        if ((d.src_ip == args.attacker_ip) | (d.dst_ip == args.attacker_ip)).any():
+        if (d.src_ip.isin(args.attacker_ip) | d.dst_ip.isin(args.attacker_ip)).any():
             raise SystemExit(f"{f} contains attacker traffic; it is not benign-only")
         parts.append(d.assign(y=0, source=f))
     if not parts:

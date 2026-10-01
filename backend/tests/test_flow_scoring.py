@@ -382,3 +382,120 @@ def test_broken_dump_disables_itself_and_never_breaks_scoring(pipe, tmp_path):
     _finish_flow(pipe)
     assert pipe._dump_path is None
     assert len(pipe.redis_client.alerts()) == 1  # the alert still went out
+
+
+# - 1 Oct 2026 WSL flood run fixes
+
+def test_synack_first_flow_is_attributed_to_the_client_not_the_server(pipe, fw):
+    """Capture missed the client's SYN: the first packet seen is the server's SYN-ACK.
+    The alert must name the client, and AutoBlock must still require a proven handshake."""
+    pipe._settings_cache = {"autoBlock": True}
+    server, client = "10.0.0.5", "8.8.4.4"
+    feed(pipe,
+         IP(src=server, dst=client) / TCP(sport=80, dport=4444, flags="SA", seq=5000, ack=1001),
+         IP(src=client, dst=server) / TCP(sport=4444, dport=80, flags="A", seq=1001, ack=5001),
+         IP(src=client, dst=server) / TCP(sport=4444, dport=80, flags="FA", seq=1001, ack=5001))
+    flow = next(iter(pipe.flow_tracker.values()))
+    assert (flow["init_src"], flow["init_dst"], flow["init_dport"]) == (client, server, 80)
+    assert flow["init_syn"] is False
+    assert [s.fwd for s in flow["packet_list"]] == [False, True, True]
+    pipe._inference_batch()
+    alerts = pipe.redis_client.alerts()
+    assert alerts and alerts[0]["src_ip"] == client
+    assert pipe._blocked == {} and not any("-I" in c for c in fw)
+
+
+class _BinaryRF:
+    classes_ = np.array([0, 1])
+
+    def __init__(self, p_attack):
+        self.p = p_attack
+
+    def predict_proba(self, x):
+        return np.tile([1 - self.p, self.p], (len(x), 1))
+
+
+@pytest.mark.parametrize("p_attack,expected", [(0.95, "Lab Flood"), (0.10, "Network Anomaly")])
+def test_binary_rf_uses_label_map_name_only_when_rf_says_attack(pipe, p_attack, expected):
+    pipe.random_forest, pipe._label_map = _BinaryRF(p_attack), {0: "Benign", 1: "Lab Flood"}
+    pipe.autoencoder.delta = 0.9                       # AE high -> an alert fires either way
+    feed(pipe, tcp("8.8.4.4", "10.0.0.5", 4444, 80, "S"), tcp("8.8.4.4", "10.0.0.5", 4444, 80, "FA"))
+    pipe._inference_batch()
+    assert pipe.redis_client.alerts()[0]["threat_type"] == expected
+
+
+class _DyingSniffer:
+    """AsyncSniffer stand-in whose session ends at once (e.g. no capture privileges)."""
+    starts = 0
+
+    def __init__(self, **kw):
+        self.running = False
+
+    def start(self):
+        type(self).starts += 1
+
+
+def test_capture_fails_loudly_when_the_session_keeps_dying(pipe, monkeypatch):
+    _DyingSniffer.starts = 0
+    monkeypatch.setattr(ids_pipeline, "AsyncSniffer", _DyingSniffer)
+    monkeypatch.setattr(pipe, "_ticker", lambda: None)
+    monkeypatch.setattr(pipe, "_capture_heartbeat", lambda: None)
+    monkeypatch.setattr(pipe, "_worker", lambda: None)
+    monkeypatch.setattr(pipe, "_capture_filter", lambda: "tcp")
+    with pytest.raises(RuntimeError, match="failed to start 3 times"):
+        pipe.start_capture("eth-test")
+    assert _DyingSniffer.starts == 3
+
+
+def test_capture_keeps_one_session_until_stopped(pipe, monkeypatch):
+    sessions = []
+
+    class _LiveSniffer:
+        def __init__(self, **kw):
+            self.running = False
+            sessions.append(self)
+
+        def start(self):
+            self.running = True
+            pipe._stop.set()                           # operator stops after start
+
+        def stop(self):
+            self.running = False
+
+    monkeypatch.setattr(ids_pipeline, "AsyncSniffer", _LiveSniffer)
+    monkeypatch.setattr(pipe, "_ticker", lambda: None)
+    monkeypatch.setattr(pipe, "_capture_heartbeat", lambda: None)
+    monkeypatch.setattr(pipe, "_worker", lambda: None)
+    monkeypatch.setattr(pipe, "_capture_filter", lambda: "tcp")
+    pipe.start_capture("eth-test")
+    assert len(sessions) == 1 and sessions[0].running is False
+
+
+# - 2 Oct 2026 CICIDS pcap replay fixes
+
+def test_rst_after_closed_flow_does_not_start_a_one_packet_flow(pipe):
+    """The trailing RST+ACK after a FIN-closed (already scored) flow must not become a new flow."""
+    feed(pipe, tcp("8.8.4.4", "10.0.0.5", 4444, 80, "S"), tcp("10.0.0.5", "8.8.4.4", 80, 4444, "SA"),
+         tcp("8.8.4.4", "10.0.0.5", 4444, 80, "FA"))
+    pipe._inference_batch()                              # flow closed on FIN, scored, dropped
+    assert pipe.flow_tracker == {}
+    feed(pipe, tcp("10.0.0.5", "8.8.4.4", 80, 4444, "RA"))
+    assert pipe.flow_tracker == {} and pipe._orphan_rst_packets == 1
+
+
+def test_rst_inside_an_open_flow_is_still_counted(pipe):
+    feed(pipe, tcp("8.8.4.4", "10.0.0.5", 4444, 80, "S"), tcp("10.0.0.5", "8.8.4.4", 80, 4444, "RA"))
+    flow = next(iter(pipe.flow_tracker.values()))
+    assert flow["packets"] == 2 and flow["done"] is True
+
+
+def test_active_stats_are_zero_without_an_idle_gap(pipe):
+    """CICIDS2017 CSV: Active > 0 only ever occurs together with Idle > 0."""
+    pkts = [tcp("8.8.4.4", "10.0.0.5", 4444, 80, "S"), tcp("8.8.4.4", "10.0.0.5", 4444, 80, "A"),
+            tcp("8.8.4.4", "10.0.0.5", 4444, 80, "A")]
+    for t, p in zip((0.0, 1.0, 2.0), pkts):              # 2 s of activity, no gap >= 5 s
+        p.time = t
+    feed(pipe, *pkts)
+    key = next(iter(pipe.flow_tracker))
+    f = dict(zip(FEATURE_ORDER, pipe._extract_flow_features(key)))
+    assert f["Idle Mean"] == 0 and f["Active Mean"] == 0 and f["Active Max"] == 0

@@ -6,7 +6,7 @@ import queue
 from datetime import datetime
 from typing import NamedTuple, Tuple
 import numpy as np
-from scapy.all import sniff, IP, TCP, UDP
+from scapy.all import AsyncSniffer, sniff, IP, TCP, UDP
 import subprocess
 import json
 import time
@@ -575,7 +575,22 @@ class RealTimeIDSPipeline:
 
         now = datetime.now()
         flow = self.flow_tracker.get(flow_key)
+        if flow is None and is_tcp and (fl & 0x04):
+            # A RST never starts a connection. It arrives after the flow already closed on FIN
+            # (and was scored and dropped), and would otherwise become a 1-packet "flow".
+            # CIC pcap replay, 2 Oct 2026: 47% of DDoS flows were such RST+ACK fragments, while
+            # the CICIDS2017 CSV has 0% one-packet flows. Count them instead of scoring them.
+            self._orphan_rst_packets = getattr(self, "_orphan_rst_packets", 0) + 1
+            return
         if flow is None:
+            # A SYN-ACK is always sent by the server. If capture missed the client's SYN
+            # (drops, capture start mid-handshake), the first packet seen is the SYN-ACK and
+            # "first packet = initiator" would name the VICTIM as the source (seen on the
+            # 1 Oct 2026 WSL flood run: 1,259 flows). Orient the flow from the client instead.
+            # init_syn stays False, so AutoBlock still requires a proven bare SYN.
+            i_src, i_sport, i_dst, i_dport = src_ip, src_port, dst_ip, dst_port
+            if is_tcp and (fl & 0x12) == 0x12:
+                i_src, i_sport, i_dst, i_dport = dst_ip, dst_port, src_ip, src_port
             flow = self.flow_tracker[flow_key] = {
                 'packets': 0,
                 'bytes': 0,
@@ -583,11 +598,11 @@ class RealTimeIDSPipeline:
                 'last_seen': now,
                 'protocol': protocol,
                 'packet_list': [],
-                # The first packet observed defines "forward".
-                'init_src': src_ip,
-                'init_sport': src_port,
-                'init_dst': dst_ip,
-                'init_dport': dst_port,
+                # The first packet observed defines "forward" (client side if it was a SYN-ACK).
+                'init_src': i_src,
+                'init_sport': i_sport,
+                'init_dst': i_dst,
+                'init_dport': i_dport,
                 'fwd_win': None,
                 'bwd_win': None,
                 'done': False,
@@ -732,6 +747,10 @@ class RealTimeIDSPipeline:
                     threat_names = [
                         self._label_map.get(int(p), f"Class {p}") for p in preds
                     ]
+                elif 1 in self._label_map:
+                    # Binary RF: name the attack class only when the RF itself says attack.
+                    threat_names = [self._label_map[1] if p is not None and p > 0.5 else None
+                                    for p in rf_attack_probs]
             except Exception as e:
                 logger.warning(f"Random Forest inference failed this batch ({e}); using autoencoder only")
 
@@ -1092,7 +1111,11 @@ class RealTimeIDSPipeline:
                 start_active = end_active = ts_us
             else:
                 end_active = ts_us
-        if (end_active - start_active) > 0:
+        # The trailing active period only counts once the flow has had an idle gap. In all
+        # 225,745 rows of the CICIDS2017 Friday CSV, Active > 0 occurs only together with
+        # Idle > 0 (100%); emitting it for gap-free flows put 48 ms Active values on CIC DDoS
+        # flows whose training rows say 0 (pcap replay, 2 Oct 2026).
+        if idle_intervals and (end_active - start_active) > 0:
             active_intervals.append(end_active - start_active)
 
         def _summary(values):
@@ -1413,20 +1436,38 @@ class RealTimeIDSPipeline:
         self._worker_thread.start()
         threading.Thread(target=self._ticker, daemon=True, name="ids-health-ticker").start()
         threading.Thread(target=self._capture_heartbeat, daemon=True, name="ids-capture-heartbeat").start()
+        iface = interface if interface and interface != 'auto' else None
         try:
-            while not self._stop.is_set():
-                sniff(
-                    iface=interface if interface and interface != 'auto' else None,
-                    prn=self.packet_callback,
-                    store=False,
-                    count=packet_count,
-                    filter=bpf,
-                    timeout=10 if packet_count == 0 else None,
-                )
-                if packet_count > 0 or self._stop.is_set():
+            if packet_count > 0:
+                sniff(iface=iface, prn=self.packet_callback, store=False,
+                      count=packet_count, filter=bpf)
+            # One long-lived capture session. The old loop (sniff(timeout=10), reopen) closed
+            # the Npcap handle every 10 s and dropped packets in each gap; on the 1 Oct 2026
+            # WSL flood run only ~25% of connections were seen. Reopen only if the session dies.
+            quick_failures = 0
+            while packet_count == 0 and not self._stop.is_set():
+                sniffer = AsyncSniffer(iface=iface, prn=self.packet_callback,
+                                       store=False, filter=bpf)
+                started = time.monotonic()
+                sniffer.start()
+                while sniffer.running and not self._stop.is_set():
+                    self._stop.wait(1.0)
+                if sniffer.running:
+                    sniffer.stop()
                     break
-                logger.warning("Scapy capture session returned; reopening interface '%s'.", interface)
-                self._stop.wait(0.5)
+                if self._stop.is_set():
+                    break
+                # AsyncSniffer (scapy 2.5) swallows errors raised in its thread, so a session
+                # that dies at once (no privileges, bad interface, Npcap down) would otherwise
+                # reopen forever. Fail loudly instead.
+                quick_failures = quick_failures + 1 if time.monotonic() - started < 5 else 0
+                if quick_failures >= 3:
+                    raise RuntimeError(
+                        f"Capture on '{interface}' failed to start 3 times in a row. Check "
+                        "Administrator rights, Npcap, and the interface name.")
+                logger.warning("Scapy capture session ended unexpectedly; reopening interface '%s'.",
+                               interface)
+                self._stop.wait(1.0)
         except Exception as e:
             logger.error(f"Packet capture error: {e}")
             raise

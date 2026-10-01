@@ -84,7 +84,7 @@
   ],
   "cases": {
     "basic_tcp_bulk": {
-      "description": "Four forward payload packets form one bulk; two backward packets test reverse window overwrite.",
+      "description": "Four forward payload packets form one bulk; two backward packets test reverse window overwrite. Active Mean/Max/Min expected 0: no idle gap, and in the CICIDS2017 Friday CSV Active > 0 only ever occurs with Idle > 0 (225,745 rows, checked 2 Oct 2026).",
       "packets": [
         {
           "time_s": 0.0,
@@ -206,10 +206,10 @@
         31000,
         3,
         20,
-        500.0,
         0.0,
-        500.0,
-        500.0,
+        0.0,
+        0.0,
+        0.0,
         0,
         0,
         0,
@@ -217,7 +217,7 @@
       ]
     },
     "idle_subflow": {
-      "description": "A >1s gap that is still under the 5s CICIDS2017 activity timeout creates no idle interval: the whole flow is one 2.5s active period. Subflow features equal the flow totals (as in the training CSV).",
+      "description": "A >1s gap that is still under the 5s CICIDS2017 activity timeout creates no idle interval: the whole flow is one 2.5s active period. Subflow features equal the flow totals (as in the training CSV). Active Mean/Max/Min expected 0: no idle gap, and in the CICIDS2017 Friday CSV Active > 0 only ever occurs with Idle > 0 (225,745 rows, checked 2 Oct 2026).",
       "packets": [
         {
           "time_s": 0.0,
@@ -323,10 +323,10 @@
         21000,
         1,
         20,
-        2500000.0,
         0.0,
-        2500000.0,
-        2500000.0,
+        0.0,
+        0.0,
+        0.0,
         0.0,
         0.0,
         0.0,
