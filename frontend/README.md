@@ -1,6 +1,6 @@
-# Frontend - AI-Based IDS Dashboard
+# Frontend — AI-Based IDS Dashboard
 
-React dashboard for the AI-Based Intrusion Detection System. It displays alert history, live alerts, traffic charts, threat intelligence, and system settings.
+React (Create React App) dashboard for the AI-Based IDS: live alerts, alert history, traffic charts, threat intelligence, and settings.
 
 ## Setup
 
@@ -9,62 +9,67 @@ npm install
 npm start
 ```
 
-The development dashboard is available at `http://localhost:3000` and uses the Create React App proxy to reach the backend at `http://localhost:5000`.
+The dev server runs at `http://localhost:3000` and proxies API and Socket.IO requests to the backend at `http://127.0.0.1:5000` (`"proxy"` in `package.json`). Start the backend first (`cd backend && python main.py`).
 
-For a production build:
+Production build:
 
 ```bash
 npm run build
 ```
 
-The frontend currently connects to Socket.IO with a relative URL (`io('/')`), so `REACT_APP_SOCKET_URL` is not a supported configuration variable.
+Under Docker, the backend serves the built app at `http://localhost:5000`.
+
+Socket.IO connects with a relative URL (`io('/')`); there is no `REACT_APP_SOCKET_URL` setting.
+
+## Authentication
+
+When the backend has `IDS_API_TOKEN` set, REST calls and Socket.IO connections must carry that token. The dashboard sends it as a Bearer header on axios and as `auth.token` on the Dashboard socket.
 
 ## Pages
 
-| Page | File | Description |
-| :--- | :--- | :--- |
-| Dashboard | `src/pages/Dashboard.jsx` | Live alerts, metrics, traffic charts, system health, and network devices |
-| Threat Intel | `src/pages/ThreatIntel.jsx` | Threat intelligence data and map view |
-| History | `src/pages/History.jsx` | Searchable and filterable alert history |
-| Settings | `src/pages/Settings.jsx` | IDS and system configuration |
+| Page         | File                      | Description |
+|--------------|---------------------------|-------------|
+| Dashboard    | `src/pages/Dashboard.jsx` | Live alerts, metrics, traffic charts, system health, network devices |
+| Threat Intel | `src/pages/ThreatIntel.jsx` | Threat-intelligence data and map view |
+| History      | `src/pages/History.jsx`   | Searchable, filterable alert history |
+| Settings     | `src/pages/Settings.jsx`  | Detection thresholds, interface and system configuration |
 
 ## Structure
 
 ```
 src/
-├── App.jsx                        # Router and page mounting
-├── index.js                       # React entry point
+├── App.jsx                 # Router and page mounting
+├── App.css
+├── index.js                # React entry; axios auth header
 ├── components/
-│   ├── AlertTable.jsx             # Alert log table
-│   ├── Charts.jsx                 # Alert charts
-│   ├── MetricCard.jsx             # Dashboard metric card
-│   ├── Navbar.jsx                 # Main navigation
-│   └── TrafficCharts.jsx          # Traffic visualisations
+│   ├── AlertTable.jsx      # Alert log table
+│   ├── Charts.jsx          # Alert charts
+│   ├── MetricCard.jsx      # Dashboard metric card
+│   ├── Navbar.jsx          # Navigation
+│   └── TrafficCharts.jsx   # Traffic visualisations
 ├── pages/
-│   ├── Dashboard.jsx              # Main dashboard and live alerts
-│   ├── History.jsx                # Historical alerts
-│   ├── Settings.jsx               # Configuration panel
-│   └── ThreatIntel.jsx            # Threat intelligence
+│   ├── Dashboard.jsx
+│   ├── History.jsx
+│   ├── Settings.jsx
+│   └── ThreatIntel.jsx
 └── styles/
-    ├── global.css                 # Global styles and design tokens
-    ├── Dashboard.css              # Dashboard layout
-    ├── Navbar.css                 # Navigation styles
-    └── Pages.css                  # Shared page styles
+    ├── global.css          # Global styles and design tokens
+    ├── Dashboard.css
+    ├── Navbar.css
+    └── Pages.css
 ```
 
-## Data Flow
+## Data flow
 
-1. The frontend loads initial data from backend REST endpoints such as `/api/history`, `/api/health`, and `/api/network-devices`.
-2. The backend reads alerts from the Redis `ids:alerts` stream and emits live `new_alert` events through Flask-SocketIO.
-3. `Dashboard.jsx` and `History.jsx` receive those events and update their views without a page refresh.
+1. Initial data comes from REST endpoints: `/api/health`, `/api/history`, `/api/threat-intel`, `/api/settings`, `/api/save-settings`, `/api/system-info`, `/api/network-interfaces`, `/api/network-devices`, `/api/reload-geoip`.
+2. The backend reads the Redis `ids:alerts` stream and emits live `new_alert` events over Flask-SocketIO.
+3. `Dashboard.jsx` and `History.jsx` subscribe to those events and update without a page refresh.
 
 ## Tests
 
-```bash
-npm test
-```
+There are no frontend tests yet. `npm test` (react-scripts) will report that no tests were found.
 
-## Known Limitations
+## Known limitations
 
-* The UI uses REST endpoints for initial data and settings, and Socket.IO for live alert updates.
-* The session alert rate is a session-level UI metric, not a ground-truth model detection rate. Model metrics are documented by the backend.
+- The session alert rate on the dashboard is a UI metric for the current session, not a model detection rate. Model metrics are in `backend/README.md`.
+- No automated frontend test coverage.
