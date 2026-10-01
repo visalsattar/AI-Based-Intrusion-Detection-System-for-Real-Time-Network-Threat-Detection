@@ -18,9 +18,18 @@ import { Laptop, Search, FileDown, RefreshCw } from 'lucide-react';
 import AlertTable from '../components/AlertTable';
 import { AttackDonut, NetworkTrafficChart } from '../components/TrafficCharts';
 
+// With IDS_API_TOKEN set, the backend refuses sockets without auth.token (main.py
+// socket_authorized). Reuse the Bearer token index.js puts on axios; a callback is
+// re-evaluated on every (re)connect, so a token saved later is picked up too.
 const socket = io("/", {
   transports: ["polling", "websocket"],
-  reconnectionAttempts: 5
+  reconnectionAttempts: 5,
+  auth: (cb) => {
+    const header = axios.defaults.headers.common['Authorization'];
+    cb(typeof header === 'string' && header.startsWith('Bearer ')
+      ? { token: header.slice(7) }
+      : {});
+  },
 });
 
 const SEVERITY_COLOR = { CRITICAL: '#EF4444', HIGH: '#F59E0B', MEDIUM: '#38BDF8' };
