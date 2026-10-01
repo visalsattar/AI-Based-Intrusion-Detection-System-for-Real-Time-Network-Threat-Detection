@@ -80,6 +80,7 @@ from ids_pipeline import RealTimeIDSPipeline
 from redis_alert_bridge import start_redis_alert_bridge, ALERT_ROOM
 from network_utils import list_interfaces
 from redis_util import make_redis
+from model_artifacts import ae_only_alerting_validated, missing_live_artifacts
 from routes import (
     allowed_hosts,
     allowed_origins,
@@ -266,13 +267,19 @@ def run_ids_capture(interface: str):
         logger.info(f"Interface '{interface}' resolved to real interface '{resolved}'")
     logger.info(f"System entering IDS mode on interface: {resolved}")
 
-    model_path = os.path.join(BASE_DIR, "models", "autoencoder.h5")
-    scaler_path = os.path.join(BASE_DIR, "models", "feature_scaler.pkl")
-    if not (os.path.exists(model_path) and os.path.exists(scaler_path)):
+    models_dir = os.path.join(BASE_DIR, "models")
+    model_path = os.path.join(models_dir, "autoencoder.h5")
+    scaler_path = os.path.join(models_dir, "feature_scaler.pkl")
+    ae_only = ae_only_alerting_validated()
+    missing = missing_live_artifacts(models_dir, ae_only)
+    if missing:
         logger.error(
-            "Cannot start packet capture — trained model artifacts are missing "
-            f"({model_path}, {scaler_path}). Run `python main.py --mode preprocess --dataset <csv>` "
+            "Cannot start packet capture — trained model artifacts are missing: "
+            f"{', '.join(missing)}. Run `python main.py --mode preprocess --dataset <csv>` "
             "then `python run_training.py` first (or download the release models, see README)."
+            + ("" if ae_only else
+               " random_forest.pkl is required: without it the pipeline falls back to the "
+               "autoencoder alone, which raises no alerts unless IDS_AE_ONLY_ALERTING_VALIDATED=true.")
         )
         return
 
