@@ -3,13 +3,20 @@
 Copy into backend/tests/ when running the project's real test environment.
 These tests require the backend's normal Scapy/project dependencies.
 """
+import os
 from datetime import datetime
 
 import numpy as np
+import pytest
 
 from scapy.all import IP, TCP, Raw
 
 from ids_pipeline import RealTimeIDSPipeline
+
+# models/*.pkl is gitignored; tests that read the trained scaler skip on a fresh clone.
+SCALER_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "feature_scaler.pkl")
+needs_scaler = pytest.mark.skipif(not os.path.exists(SCALER_PATH),
+                                  reason="models/feature_scaler.pkl not present")
 
 
 def _pipeline_with_packets(packets, directions):
@@ -87,24 +94,22 @@ def test_gap_under_activity_timeout_is_not_idle():
     assert f[74] == 0 and f[77] == 0   # Idle Mean / Idle Min
 
 
+@needs_scaler
 def test_training_zero_features_match_scaler_premise():
     """The six Bulk features are zeroed before scaling because the scaler saw only zeros."""
-    import os
     import joblib
-    path = os.path.join(os.path.dirname(__file__), "..", "models", "feature_scaler.pkl")
-    scaler = joblib.load(path)
+    scaler = joblib.load(SCALER_PATH)
     names = list(scaler.feature_names_in_)
     for col in RealTimeIDSPipeline.TRAINING_ZERO_FEATURES:
         i = names.index(col)
         assert scaler.data_min_[i] == 0 and scaler.data_max_[i] == 0, col
 
 
+@needs_scaler
 def test_training_binary_features_match_scaler_premise():
     """Flag columns are clamped to presence (0/1) before scaling because the training CSV only holds 0/1."""
-    import os
     import joblib
-    path = os.path.join(os.path.dirname(__file__), "..", "models", "feature_scaler.pkl")
-    scaler = joblib.load(path)
+    scaler = joblib.load(SCALER_PATH)
     names = list(scaler.feature_names_in_)
     for col in RealTimeIDSPipeline.TRAINING_BINARY_FEATURES:
         i = names.index(col)

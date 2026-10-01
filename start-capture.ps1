@@ -2,7 +2,9 @@ param(
     [string]$Interface = 'auto',
     [switch]$LiveLab,
     [switch]$EnableValidatedAeOnly,
-    [string]$FeatureDump
+    [string]$FeatureDump,
+    # Optional: Random Forest directory under backend\models (e.g. live_flow_v1). Default = shipped CICIDS2017 RF.
+    [string]$RfDir
 )
 
 $ErrorActionPreference = 'Stop'
@@ -16,6 +18,9 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     if ($FeatureDump) {
         $safeDump = $FeatureDump.Replace('"', '\"')
         $arguments += ' -FeatureDump "' + $safeDump + '"'
+    }
+    if ($RfDir) {
+        $arguments += ' -RfDir "' + $RfDir.Replace('"', '\"') + '"'
     }
     Start-Process -FilePath $pwsh -Verb RunAs -ArgumentList $arguments
     exit
@@ -56,6 +61,15 @@ $env:IDS_EVIDENCE_ORIGIN = if ($LiveLab) { 'live_lab' } else { 'live_unclassifie
 # Never enable AE-only alerting just because capture started. Enable it only
 # after validate_live_capture.py passes on a labelled controlled-lab capture.
 $env:IDS_AE_ONLY_ALERTING_VALIDATED = if ($EnableValidatedAeOnly) { 'true' } else { 'false' }
+if ($RfDir) {
+    if (-not (Test-Path -LiteralPath (Join-Path $root "backend\models\$RfDir\random_forest.pkl"))) {
+        throw "No random_forest.pkl in backend\models\$RfDir. Train it first (backend\train_live_flow.py)."
+    }
+    $env:IDS_RF_DIR = $RfDir
+    Write-Host "Using Random Forest from backend\models\$RfDir" -ForegroundColor Yellow
+} else {
+    Remove-Item Env:IDS_RF_DIR -ErrorAction SilentlyContinue
+}
 if ($FeatureDump) {
     $env:IDS_DUMP_FEATURES = if ([IO.Path]::IsPathRooted($FeatureDump)) {
         $FeatureDump

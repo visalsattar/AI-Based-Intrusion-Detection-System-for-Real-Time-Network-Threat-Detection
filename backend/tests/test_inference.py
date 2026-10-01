@@ -261,6 +261,63 @@ def test_ae_override_catches_novel_attack(pipeline):
     assert alerts[0]["anomaly_score"] > 0.97
 
 
+def test_unconfirmed_ae_override_is_capped_and_never_autoblocks(pipeline, monkeypatch):
+    """Live benign capture (1 Oct 2026): every false alert was an AE override on a large
+    download, some CRITICAL. An override the RF does not confirm is capped at MEDIUM, so it
+    can never reach the CRITICAL-only AutoBlock path."""
+    pipeline.redis_client = FakeRedis()
+    blocked = []
+    monkeypatch.setattr(pipeline, "_load_settings", lambda: {"autoBlock": True})
+    monkeypatch.setattr(pipeline, "_should_block", lambda flow: True)
+    monkeypatch.setattr(pipeline, "_block", blocked.append)
+    flow_key = _make_flow(pipeline)
+
+    pipeline._process_prediction(flow_key, recon_error=1000.0, rf_attack_prob=0.05)
+
+    alert = pipeline.redis_client.alerts()[0]
+    assert alert["anomaly_score"] > 0.97           # score itself is not hidden
+    assert alert["severity"] == pipeline.AE_OVERRIDE_MAX_SEVERITY == "MEDIUM"
+    assert blocked == []
+
+
+def test_ids_rf_dir_loads_rf_and_label_map_from_that_directory(tmp_path, monkeypatch):
+    """IDS_RF_DIR swaps in a live-trained RF (train_live_flow.py) and its threat names."""
+    import joblib
+    from sklearn.ensemble import RandomForestClassifier
+    rf = RandomForestClassifier(n_estimators=2, random_state=0).fit(
+        np.r_[np.zeros((4, 78)), np.ones((4, 78))], [0] * 4 + [1] * 4)
+    joblib.dump(rf, tmp_path / "random_forest.pkl")
+    (tmp_path / "label_map.json").write_text('{"0": "Benign", "1": "Lab Flood"}')
+    monkeypatch.setenv("IDS_RF_DIR", str(tmp_path))      # absolute path wins over models/
+
+    ids = RealTimeIDSPipeline(model_path=MODEL_PATH, feature_extractor_path=SCALER_PATH)
+
+    assert os.path.normpath(ids.rf_dir) == os.path.normpath(str(tmp_path))
+    assert ids.random_forest.n_estimators == 2
+    assert ids._label_map == {0: "Benign", 1: "Lab Flood"}
+
+
+def test_default_rf_dir_is_models_directory(monkeypatch):
+    monkeypatch.delenv("IDS_RF_DIR", raising=False)
+    ids = RealTimeIDSPipeline(model_path=MODEL_PATH, feature_extractor_path=SCALER_PATH)
+    assert os.path.normpath(ids.rf_dir) == os.path.normpath(os.path.dirname(MODEL_PATH))
+
+
+def test_rf_confirmed_attack_still_reaches_critical_and_autoblock(pipeline, monkeypatch):
+    pipeline.redis_client = FakeRedis()
+    blocked = []
+    monkeypatch.setattr(pipeline, "_load_settings", lambda: {"autoBlock": True})
+    monkeypatch.setattr(pipeline, "_should_block", lambda flow: True)
+    monkeypatch.setattr(pipeline, "_block", blocked.append)
+    flow_key = _make_flow(pipeline)
+
+    pipeline._process_prediction(flow_key, recon_error=1000.0, rf_attack_prob=0.99)
+
+    alert = pipeline.redis_client.alerts()[0]
+    assert alert["severity"] == "CRITICAL"
+    assert len(blocked) == 1
+
+
 def test_rf_override_confirms_known_attack(pipeline):
     """A very confident RF (P(attack) > 0.90) must alert even if the AE is calm."""
     pipeline.redis_client = FakeRedis()

@@ -72,7 +72,7 @@ Held-out DDoS/benign flow-level evaluation:
 | CNN            | 99.76%   | 99.12%    | 99.91% | 99.51% | Offline only       |
 
 - All rows are **offline** results on the 45,149-row held-out flow-level test split (chronological last 20%, no shuffle; ~25% DDoS). RF and AE rows come from `backend/models/real_metrics.json`.
-- The cutoff-0.5 fusion row comes from `backend/evaluate_ddos_heldout.py`. It is **not** the live rule: live alerts need a score above 0.85 at the default sensitivity. The live-gate row applies the actual rule from `ids_pipeline.py` to the same split (recomputed 2026-10-01, Windows, Python 3.11; see `PROGRESS.md`). At high sensitivity (> 0.70) F1 is 99.35%; at low (> 0.95) it is 99.64%.
+- The cutoff-0.5 fusion row comes from `backend/evaluate_ddos_heldout.py`. It is **not** the live rule: live alerts need a score above 0.85 at the default sensitivity. The live-gate row applies the actual rule from `ids_pipeline.py` to the same split (recomputed 2026-10-01, Windows, Python 3.11). At high sensitivity (> 0.70) F1 is 99.35%; at low (> 0.95) it is 99.64%.
 - The CNN result uses a separate 4,505-sequence subset (100-row windows, stride 10). It is **not** directly comparable to the flow-level rows.
 - These are experiment-specific results on one CICIDS2017 day (DDoS vs benign). They are not cross-dataset validation, not evidence for other CICIDS2017 attack families, and not a guarantee of live-network accuracy.
 - Training data is one binary task, DDoS vs benign. No PortScan, brute-force, web-attack or botnet detection is claimed.
@@ -235,7 +235,7 @@ cd backend
 python -m pytest tests/ -v
 ```
 
-Current result: **248 passed** (Windows 11, Python 3.11.9, 2026-10-01).
+Current result: **250 passed** (Windows 11, Python 3.11.9, 2026-10-01).
 
 Coverage areas: preprocessing, sequence construction and leakage regression, live inference/fusion logic, CICFlowMeter reference-fixture feature parity, flow scoring, route security and auth, threat-intelligence privacy, whitelist behaviour, and AutoBlock command behaviour. Two dependency deprecation warnings (Scapy/cryptography) are expected.
 
@@ -253,13 +253,22 @@ These are workload-specific development measurements on **synthetic** flows: in-
 
 ## Live detection status
 
-Controlled LAN lab runs on 2026-10-01 (laptop sensor on Ethernet, a second device sending a sequential TCP connect+GET flood to a listener on the laptop; details in `PROGRESS.md`):
+Controlled LAN lab runs on 2026-10-01 (laptop sensor on Ethernet, a second device sending a sequential TCP connect+GET flood to a listener on the laptop):
 
-- After the train/serve fixes above, the system stays quiet on ordinary laptop traffic but does **not** alert on the flood (fused score about 0.47, below 0.85).
+- After the train/serve fixes above, the system does **not** alert on the flood (fused score about 0.47, below 0.85).
 - The RF gave P(attack) above 0.5 on 0% of flood flows. The training "DDoS" class is slow LOIC-style flows (median 1.88 s, ~11.6 KB replies); the lab flood is fast and tiny (~6 ms, 59 bytes). Flows shaped like the training attack reached only 0.23–0.25.
 - Earlier lab "detections" were an artefact of flag-count skew, since fixed.
 
-So the live path works, but live detection quality is not demonstrated, and RF generalisation beyond the Friday DDoS capture is unproven. A 1-hour benign capture to measure the live false-alert rate is in progress.
+**Benign false-alert rate** (56-minute capture of normal laptop use, 1,958 flows, no lab traffic):
+
+- 0.5% of benign flows raised an alert, about 8.5 alerts per hour. Every one came from the Autoencoder override on large, long TCP sessions such as downloads and streams. The RF never exceeded 0.25 P(attack) on any of them.
+- Changing `alert_threshold` anywhere from 0.60 to 0.95 does not change this, because the override score is above 0.97. It stays at 0.85.
+- An Autoencoder override that the RF does not confirm is now capped at **MEDIUM** severity, so it can never reach CRITICAL or trigger automatic blocking. The alert still appears, with its score.
+- Recalibrating the override on this capture (0.97 → 0.9734) gave the same 0.4% held-out rate, so the coded default was kept.
+
+**Latency:** a flow is scored only when it finishes (FIN/RST, 15 s idle or 120 s maximum), so attack-start → alert takes seconds by design. After scoring, Redis → dashboard client delivery measured 2.5 ms median (7.3 ms p95) on the live stack. A true capture → browser measurement under attack traffic has not been made.
+
+So the live path works and its benign false-alert rate is now measured, but live attack detection is not demonstrated, and RF generalisation beyond the Friday DDoS capture is unproven.
 
 ## Redis and persistence
 

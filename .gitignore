@@ -39,6 +39,8 @@ backend/data/preprocessed/*.npy
 # --- AI Models & Scalers (CRITICAL) ---
 backend/models/*.h5
 backend/models/*.pkl
+# Models trained on local live captures (train_live_flow.py) — local only
+backend/models/live_flow_v1/
 
 # --- Metrics ---
 # If you want to ignore this file, remove the ! at the start.

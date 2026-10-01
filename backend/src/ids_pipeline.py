@@ -255,7 +255,15 @@ class RealTimeIDSPipeline:
         "Bwd Avg Bytes/Bulk", "Bwd Avg Packets/Bulk", "Bwd Avg Bulk Rate",
         # Bwd PSH Flags has scaler max 0 in training (always 0); a live count would pass unscaled.
         "Bwd PSH Flags",
+        # Same zero-range scaler columns (data_min_ = data_max_ = 0), found by the 1 Oct 2026 review.
+        "Fwd URG Flags", "Bwd URG Flags", "CWE Flag Count",
     )
+
+    # An autoencoder override the Random Forest did not confirm is capped at this severity,
+    # so it never reaches CRITICAL (and therefore never triggers AutoBlock). Measured on a
+    # 56-minute live benign capture (benign_long.csv, 1 Oct 2026): every false alert came
+    # from this override (0.5% of flows, ~8.5 alerts/h, 3 of 8 CRITICAL on large downloads).
+    AE_OVERRIDE_MAX_SEVERITY = "MEDIUM"
 
     # In the CICIDS2017 Friday CSV these flag columns only ever hold 0 or 1 (scaler max = 1),
     # i.e. flag *presence*, whereas BasicFlow.java and _extract_flow_features count packets
@@ -333,9 +341,16 @@ class RealTimeIDSPipeline:
         self.random_forest = None
         self._rf_attack_idx = None
         self._rf_multiclass = False
+        # IDS_RF_DIR (opt-in) loads random_forest.pkl + label_map.json from another directory,
+        # e.g. a model trained on live captures by train_live_flow.py. Relative paths resolve
+        # against the models directory. Unset = the shipped CICIDS2017 RF next to the AE.
+        models_dir = os.path.dirname(model_path)
+        self.rf_dir = os.path.join(models_dir, os.environ.get("IDS_RF_DIR", "").strip() or ".")
+        self.rf_dir = os.path.normpath(self.rf_dir)
         try:
             from joblib import load
-            rf_path = os.path.join(os.path.dirname(model_path), 'random_forest.pkl')
+            rf_path = os.path.join(self.rf_dir, 'random_forest.pkl')
+            logger.info(f"Random Forest source: {rf_path}")
             self.random_forest = load(rf_path)
             classes = list(self.random_forest.classes_)
             if 0 not in classes:
@@ -351,7 +366,7 @@ class RealTimeIDSPipeline:
 
         # Attack-type label map written by preprocess_pipeline(multiclass=True).
         self._label_map = {}
-        label_map_path = os.path.join(os.path.dirname(model_path), 'label_map.json')
+        label_map_path = os.path.join(self.rf_dir, 'label_map.json')
         try:
             with open(label_map_path) as f:
                 self._label_map = {int(k): v for k, v in json.load(f).items()}
@@ -1191,6 +1206,8 @@ class RealTimeIDSPipeline:
 
         if anomaly_score > alert_cutoff:
             severity = self._compute_severity(anomaly_score, settings)
+            if override_reason and override_reason.startswith('autoencoder override'):
+                severity = self.AE_OVERRIDE_MAX_SEVERITY
 
             # Cooldown per (source, severity), not per port (port scans rotate ports).
             k = (src_ip, severity)
