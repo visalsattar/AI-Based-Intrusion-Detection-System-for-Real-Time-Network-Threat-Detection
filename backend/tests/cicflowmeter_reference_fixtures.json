@@ -198,10 +198,10 @@
         0,
         0,
         0,
-        0,
-        0,
-        0,
-        0,
+        4,
+        100,
+        2,
+        110,
         64240,
         31000,
         3,
@@ -217,7 +217,7 @@
       ]
     },
     "idle_subflow": {
-      "description": "A >1s gap creates one subflow boundary and one idle interval.",
+      "description": "A >1s gap creates one subflow boundary but, being under the 5s CICIDS2017 activity timeout, no idle interval: the whole flow is one 2.5s active period.",
       "packets": [
         {
           "time_s": 0.0,
@@ -323,14 +323,14 @@
         21000,
         1,
         20,
-        500000.0,
+        2500000.0,
         0.0,
-        500000.0,
-        500000.0,
-        1500000.0,
+        2500000.0,
+        2500000.0,
         0.0,
-        1500000.0,
-        1500000.0
+        0.0,
+        0.0,
+        0.0
       ]
     }
   }

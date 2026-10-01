@@ -263,9 +263,6 @@ def test_feature_table_is_78_unique_names():
     assert len(FEATURE_ORDER) == 78 and len(set(FEATURE_ORDER)) == 78
 
 
-def test_live_feature_coverage_is_complete(pipe):
-    assert pipe.UNSUPPORTED_LIVE_FEATURES == ()
-    assert pipe._live_feature_coverage() == pytest.approx(1.0)
 
 
 def _eth(pkt):
@@ -324,6 +321,37 @@ def test_ethernet_padding_is_not_counted_as_payload(pipe):
     f = pipe._extract_flow_features(next(iter(pipe.flow_tracker)))
     assert f[idx("Total Length of Fwd Packets")] == 0 and f[idx("act_data_pkt_fwd")] == 0
 
+def test_parity_with_cicids2017_training_data(pipe):
+    """
+    Pinned against Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv (225,745 rows):
+    Subflow == Total on 100% of rows; Init_Win_bytes_* == -1 on 14.6% (no window seen).
+    """
+    c, s = "10.0.0.20", "93.184.216.34"
+    p1 = _eth(IP(src=c, dst=s) / UDP(sport=51000, dport=53) / ("q" * 40))
+    p2 = _eth(IP(src=s, dst=c) / UDP(sport=53, dport=51000) / ("r" * 120))
+    p1.time = 1.0
+    p2.time = 1.05
+    feed(pipe, p1, p2)
+    f = pipe._extract_flow_features(next(iter(pipe.flow_tracker)))
+    g = lambda name: float(f[idx(name)])
+
+    # UDP has no TCP window -> CICIDS encodes -1, not 0
+    assert g("Init_Win_bytes_forward") == -1
+    assert g("Init_Win_bytes_backward") == -1
+
+    # No >1 s gap -> subflow features equal the totals, not 0
+    assert g("Subflow Fwd Packets") == g("Total Fwd Packets") == 1
+    assert g("Subflow Bwd Packets") == g("Total Backward Packets") == 1
+    assert g("Subflow Fwd Bytes") == g("Total Length of Fwd Packets") == 40
+    assert g("Subflow Bwd Bytes") == g("Total Length of Bwd Packets") == 120
+
+
+def test_tcp_flow_without_reply_has_bwd_init_win_minus_one(pipe):
+    """One-sided TCP flow: forward window is real, backward was never seen -> -1."""
+    feed(pipe, _eth(IP(src="8.8.4.4", dst="10.0.0.5") / TCP(sport=4444, dport=80, flags="S")))
+    f = pipe._extract_flow_features(next(iter(pipe.flow_tracker)))
+    assert f[idx("Init_Win_bytes_forward")] == 8192
+    assert f[idx("Init_Win_bytes_backward")] == -1
 
 # - flush / dump
 

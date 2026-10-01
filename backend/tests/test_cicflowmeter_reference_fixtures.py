@@ -95,7 +95,7 @@ def _pipeline_with_flow(case):
 
 
 @pytest.mark.parametrize("case_name", sorted(FIXTURES["cases"]))
-def test_scapy_matches_cicflowmeter_reference_fixture(case_name):
+def test_extractor_matches_hand_calculated_cicflowmeter_v4_oracle(case_name):
     case = FIXTURES["cases"][case_name]
     pipeline, flow_key = _pipeline_with_flow(case)
 

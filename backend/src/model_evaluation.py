@@ -144,5 +144,5 @@ def run_full_evaluation(preprocessed_csv_path: str,
 
 if __name__ == "__main__":
     path = sys.argv[1] if len(sys.argv) > 1 else \
-        "data/preprocessed/CICIDS2017_cleaned_FIXED.csv"
+        "data/preprocessed/CICIDS2017_cleaned.csv"
     run_full_evaluation(path)

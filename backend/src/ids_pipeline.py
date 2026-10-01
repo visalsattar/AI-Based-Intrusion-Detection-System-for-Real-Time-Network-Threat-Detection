@@ -239,6 +239,34 @@ class RealTimeIDSPipeline:
     # the IDS flow timeout (an operational eviction bound, not a feature definition).
     CICFLOWMETER_ACTIVITY_TIMEOUT_US = 1_000_000
 
+    # Active/Idle uses the flow's activityTimeout, which is 5 s in the CICIDS2017 data:
+    # the smallest non-zero 'Idle Min' in the Friday-DDoS CSV is 5,000,005 us and no idle
+    # value lies between 1 s and 5 s. Using the 1 s bulk/subflow boundary here would emit
+    # idle gaps the models never saw in training.
+    CICFLOWMETER_ACTIVE_IDLE_TIMEOUT_US = 5_000_000
+
+    # The six Bulk columns are exactly 0 in every row of the CICIDS2017 training CSV
+    # (known CICFlowMeter output quirk), so the scaler has zero range for them and would
+    # pass a live value such as 333333 through unscaled. They are computed in
+    # _extract_flow_features (kept CICFlowMeter-faithful) but zeroed before scaling so the
+    # model sees the same input distribution it was trained on.
+    TRAINING_ZERO_FEATURES = (
+        "Fwd Avg Bytes/Bulk", "Fwd Avg Packets/Bulk", "Fwd Avg Bulk Rate",
+        "Bwd Avg Bytes/Bulk", "Bwd Avg Packets/Bulk", "Bwd Avg Bulk Rate",
+        # Bwd PSH Flags has scaler max 0 in training (always 0); a live count would pass unscaled.
+        "Bwd PSH Flags",
+    )
+
+    # In the CICIDS2017 Friday CSV these flag columns only ever hold 0 or 1 (scaler max = 1),
+    # i.e. flag *presence*, whereas BasicFlow.java and _extract_flow_features count packets
+    # (live SYN=2, ACK=8, ...). Measured on lab_run2.csv (1 Oct 2026): feeding the raw counts
+    # put 86-96% of flows above the training max and made the autoencoder score every flood
+    # flow as an override; clamping to presence removed that artefact. Clamped before scaling.
+    TRAINING_BINARY_FEATURES = (
+        "Fwd PSH Flags", "FIN Flag Count", "SYN Flag Count", "RST Flag Count",
+        "PSH Flag Count", "ACK Flag Count", "URG Flag Count", "ECE Flag Count",
+    )
+
     UNSUPPORTED_LIVE_FEATURES = ()
 
     def __init__(self,
@@ -654,6 +682,12 @@ class RealTimeIDSPipeline:
 
         features_array = np.asarray(features_batch, dtype=np.float32)
         features_df = pd.DataFrame(features_array, columns=feature_names)
+        for _col in self.TRAINING_ZERO_FEATURES:
+            if _col in features_df.columns:
+                features_df[_col] = 0.0
+        for _col in self.TRAINING_BINARY_FEATURES:
+            if _col in features_df.columns:
+                features_df[_col] = (features_df[_col] > 0).astype(np.float32)
         features_normalized = self.feature_scaler.transform(features_df)
 
         reconstructed = self.autoencoder.predict(
@@ -868,9 +902,11 @@ class RealTimeIDSPipeline:
 
         fwd_lengths = np.array([p.plen for p in fwd_pkts], dtype=np.float64)
         bwd_lengths = np.array([p.plen for p in bwd_pkts], dtype=np.float64)
-        # TODO(verify): the first packet is counted twice. Keep only if it matches
-        # BasicFlow.firstPacket() + addPacket() double-add in the reference Java;
-        # cite the line here or remove the prefix.
+        # Verified against backend/BasicFlow.java: firstPacket() calls
+        # flowLengthStats.addValue() once unconditionally (line 129) and again inside the
+        # forward/backward branch (lines 142/156), so the first packet is counted twice in
+        # the flow-wide length stats. This mirrors CICFlowMeter, which generated the
+        # training data; do not 'fix' it.
         all_lengths = np.array(
             [all_pkts[0].plen] + [p.plen for p in all_pkts],
             dtype=np.float64,
@@ -924,28 +960,21 @@ class RealTimeIDSPipeline:
         avg_fwd_segment_size = fwd_pkt_mean
         avg_bwd_segment_size = bwd_pkt_mean
 
-        init_win_fwd = float(flow['fwd_win']) if flow['fwd_win'] is not None else 0.0
-        init_win_bwd = float(flow['bwd_win']) if flow['bwd_win'] is not None else 0.0
+        # CICIDS2017 raw data encodes "no window observed" as -1 (14.6% of training rows).
+        init_win_fwd = float(flow['fwd_win']) if flow['fwd_win'] is not None else -1.0
+        init_win_bwd = float(flow['bwd_win']) if flow['bwd_win'] is not None else -1.0
+        
         # First forward packet excluded; subsequent forward packets with payload counted.
         act_data_pkt_fwd = float(sum(1 for p in fwd_pkts[1:] if p.plen >= 1))
         min_seg_size_fwd = float(min((p.hlen for p in fwd_pkts), default=0))
 
         # --- CICFlowMeter subflow statistics ---------------------------------
-        sf_count = 0
-        last_ts_us = None
-        for p in all_pkts:
-            ts_us = int(round(p.ts * 1_000_000.0))
-            if last_ts_us is not None and (ts_us - last_ts_us) > self.CICFLOWMETER_ACTIVITY_TIMEOUT_US:
-                sf_count += 1
-            last_ts_us = ts_us
-        if sf_count > 0:
-            subflow_fwd_packets = total_fwd_packets // sf_count
-            subflow_fwd_bytes = int(total_len_fwd) // sf_count
-            subflow_bwd_packets = total_bwd_packets // sf_count
-            subflow_bwd_bytes = int(total_len_bwd) // sf_count
-        else:
-            subflow_fwd_packets = subflow_fwd_bytes = 0
-            subflow_bwd_packets = subflow_bwd_bytes = 0
+        # Training data: Subflow == Total on 100% of 225,745 rows (verified
+        # 2026-10-01 against Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv).
+        subflow_fwd_packets = total_fwd_packets
+        subflow_fwd_bytes = total_len_fwd
+        subflow_bwd_packets = total_bwd_packets
+        subflow_bwd_bytes = total_len_bwd
 
         # --- CICFlowMeter bulk statistics ------------------------------------
         # Mirror BasicFlow.updateForwardBulk/updateBackwardBulk: only payload packets
@@ -1041,7 +1070,7 @@ class RealTimeIDSPipeline:
         start_active = end_active = int(round(all_pkts[0].ts * 1_000_000.0))
         for p in all_pkts[1:]:
             ts_us = int(round(p.ts * 1_000_000.0))
-            if (ts_us - end_active) > self.CICFLOWMETER_ACTIVITY_TIMEOUT_US:
+            if (ts_us - end_active) > self.CICFLOWMETER_ACTIVE_IDLE_TIMEOUT_US:
                 if (end_active - start_active) > 0:
                     active_intervals.append(end_active - start_active)
                 idle_intervals.append(ts_us - end_active)

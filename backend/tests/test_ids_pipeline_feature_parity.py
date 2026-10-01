@@ -55,7 +55,7 @@ def test_subflow_bulk_and_active_idle_statistics_are_populated():
         _tcp("10.0.0.1", "10.0.0.2", "PA", b"b" * 10, 0.1),
         _tcp("10.0.0.1", "10.0.0.2", "PA", b"c" * 10, 0.2),
         _tcp("10.0.0.1", "10.0.0.2", "PA", b"d" * 10, 0.3),
-        _tcp("10.0.0.1", "10.0.0.2", "PA", b"e" * 10, 2.0),
+        _tcp("10.0.0.1", "10.0.0.2", "PA", b"e" * 10, 6.0),
     ]
     obj, key = _pipeline_with_packets(packets, [True] * len(packets))
     f = obj._extract_flow_features(key)
@@ -70,12 +70,48 @@ def test_subflow_bulk_and_active_idle_statistics_are_populated():
     # Active intervals: 0.3s and 0.0s after the isolated final packet.
     assert f[70] == 300000
     assert f[73] == 300000
-    # Idle gap from 0.3s to 2.0s.
-    assert f[74] == 1700000
-    assert f[77] == 1700000
+    # Idle gap from 0.3s to 6.0s (> the 5s activity timeout used by CICIDS2017).
+    assert f[74] == 5700000
+    assert f[77] == 5700000
 
 
-def test_single_packet_udp_like_flow_uses_zero_initial_windows():
+def test_gap_under_activity_timeout_is_not_idle():
+    """CICIDS2017 idle values are all >= 5s (min seen: 5,000,005 us in Friday-DDoS)."""
+    packets = [
+        _tcp("10.0.0.1", "10.0.0.2", "PA", b"a" * 10, 0.0),
+        _tcp("10.0.0.1", "10.0.0.2", "PA", b"b" * 10, 0.1),
+        _tcp("10.0.0.1", "10.0.0.2", "PA", b"c" * 10, 2.0),
+    ]
+    obj, key = _pipeline_with_packets(packets, [True] * len(packets))
+    f = obj._extract_flow_features(key)
+    assert f[74] == 0 and f[77] == 0   # Idle Mean / Idle Min
+
+
+def test_training_zero_features_match_scaler_premise():
+    """The six Bulk features are zeroed before scaling because the scaler saw only zeros."""
+    import os
+    import joblib
+    path = os.path.join(os.path.dirname(__file__), "..", "models", "feature_scaler.pkl")
+    scaler = joblib.load(path)
+    names = list(scaler.feature_names_in_)
+    for col in RealTimeIDSPipeline.TRAINING_ZERO_FEATURES:
+        i = names.index(col)
+        assert scaler.data_min_[i] == 0 and scaler.data_max_[i] == 0, col
+
+
+def test_training_binary_features_match_scaler_premise():
+    """Flag columns are clamped to presence (0/1) before scaling because the training CSV only holds 0/1."""
+    import os
+    import joblib
+    path = os.path.join(os.path.dirname(__file__), "..", "models", "feature_scaler.pkl")
+    scaler = joblib.load(path)
+    names = list(scaler.feature_names_in_)
+    for col in RealTimeIDSPipeline.TRAINING_BINARY_FEATURES:
+        i = names.index(col)
+        assert scaler.data_min_[i] == 0 and scaler.data_max_[i] == 1, col
+
+
+def test_single_packet_flow_without_window_uses_minus_one():
     # The extractor's UDP path is exercised indirectly here by using a TCP packet
     # without relying on a captured TCP window for the missing direction.
     p = _tcp("10.0.0.1", "10.0.0.2", "S", b"", 0.0)
@@ -83,7 +119,7 @@ def test_single_packet_udp_like_flow_uses_zero_initial_windows():
     obj.flow_tracker[key]["fwd_win"] = None
     obj.flow_tracker[key]["bwd_win"] = None
     f = obj._extract_flow_features(key)
-    assert f[66] == 0
-    assert f[67] == 0
+    assert f[66] == -1
+    assert f[67] == -1
     assert f[68] == 0
     assert np.isfinite(f).all()

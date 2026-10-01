@@ -48,6 +48,7 @@ COPY --from=frontend-builder /frontend/build /frontend/build
 # Packet capture needs root + NET_RAW, so it lives in the separate `sniffer` service
 # (docker-compose.yml, profile "capture"), which overrides `user:`.
 ENV IDS_BIND=0.0.0.0
+ENV MPLCONFIGDIR=/tmp/mpl
 USER ids
 
 EXPOSE 5000
