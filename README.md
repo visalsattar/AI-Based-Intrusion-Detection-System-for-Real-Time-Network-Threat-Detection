@@ -1,269 +1,261 @@
-AI-Based Intrusion Detection System (IDS)
+# AI-Based Intrusion Detection System (IDS)
 
-Final Year Project — BS Computer Science, The University of Agriculture, Peshawar
+**Final Year Project — BS Computer Science, The University of Agriculture, Peshawar**
 
-Summary
+A network intrusion detection system that monitors live traffic and scores flows in real time with a fused **Random Forest + Autoencoder** pipeline. A third model, a **CNN**, was trained and evaluated offline for architecture comparison only. It is **not** part of the live detection path (see [Why the CNN doesn't run live](#why-the-cnn-doesnt-run-live)).
 
-An AI-powered Network Intrusion Detection System (IDS) that monitors live network traffic and detects cyberattacks in real time using a fused Random Forest + Autoencoder pipeline. A third model — a CNN — was trained and evaluated offline for architecture comparison, but is not part of the live detection path (see Why the CNN doesn't run live, below).
+## The problem
 
-The Problem It Solves:
-Traditional network security relies on signature-based detection — a list of known attack patterns. If an attacker uses a new technique not in the list, it goes undetected. This system learns what normal traffic looks like and flags anything that deviates, including attacks that have never been seen before.
+Signature-based detection only catches attack patterns already on a list. This system combines a supervised classifier (Random Forest, for known attacks) with an Autoencoder trained on benign traffic (flags flows that deviate from normal), so it has a path to flag traffic that matches no known signature.
 
-Why It Is a Strong Project:
+## Highlights
 
-Two models fused for live detection, with a third (CNN) built and benchmarked offline to compare architectures
+- Two models fused for live detection; a CNN built and benchmarked offline as an architecture comparison
+- Trained and evaluated on 225,745 real CICIDS2017 flows (Friday DDoS capture)
+- Full stack: Scapy capture → feature extraction → ML fusion → Redis Streams → Flask/Socket.IO → React dashboard, packaged with Docker
+- Automated pytest suite covering preprocessing, sequence construction and train/test leakage, inference/fusion logic, flow scoring, route security, threat-intel privacy, whitelist and AutoBlock behaviour
+- The Autoencoder's weak standalone metrics are reported below, not omitted
 
-Real dataset — 225,745 actual network flows (CICIDS2017), not toy data
+## How it works
 
-Full stack — AI + backend + frontend + Docker integration, with automated regression tests
-
-Honest reporting — the Autoencoder's weaker standalone performance is disclosed, not hidden
-
-Automated tests cover preprocessing, flow scoring, route security, threat-intel privacy, and train/test leakage
-
-Redis Streams, WebSockets, and Docker health checks for the live pipeline
-
-How It Works
-
+```
 Network Traffic
       │
       ▼
-┌─────────────┐    ┌──────────────────┐    ┌─────────────────────────┐
-│   Packet    │    │    Feature       │    │    Live Fusion          │
-│   Capture   │───▶│    Extraction    │───▶│                         │
-│   (Scapy)   │    │  (78 CICIDS2017  │    │  Autoencoder (AE)       │
-└─────────────┘    │    features)     │    │  + Random Forest (RF)   │
-                    └──────────────────┘    │                         │
-                                            │  score = 0.5×AE + 0.5×RF│
-                                            └────────────┬────────────┘
+┌─────────────┐    ┌──────────────────┐     ┌──────────────────────────┐
+│   Packet    │    │    Feature       │     │    Live Fusion           │
+│   Capture   │───▶│   Extraction    │───▶ │                          │
+│   (Scapy)   │    │  (78 CICIDS2017  │     │  Autoencoder (AE)        │
+└─────────────┘    │    features)     │     │  + Random Forest (RF)    │
+                   └──────────────────┘     │                          │
+                                            │  score = 0.5×AE + 0.5×RF │
+                                            └────────────┬─────────────┘
                                                          │
                                                          ▼
-                                            ┌─────────────────────────┐
-                                            │    Alert Engine         │
-                                            │  (Redis ids:alerts)     │
-                                            └────────────┬────────────┘
+                                            ┌──────────────────────────┐
+                                            │    Alert Engine          │
+                                            │ (Redis stream ids:alerts)│
+                                            └────────────┬─────────────┘
                                                          │
                                                          ▼
-                                            ┌─────────────────────────┐
-                                            │    React Dashboard      │
-                                            │  (Flask + Socket.IO)    │
-                                            └─────────────────────────┘
+                                            ┌──────────────────────────┐
+                                            │    React Dashboard       │
+                                            │  (Flask + Socket.IO)     │
+                                            └──────────────────────────┘
+```
 
-Fusion logic: score = 0.5 × AE anomaly score + 0.5 × RF attack probability. Two override rules apply: if AE confidence exceeds 0.97, AE wins outright; if RF confidence exceeds 0.90, RF wins outright. An alert fires when the fused score exceeds 0.85.
+**Fusion logic** (`backend/src/ids_pipeline.py`):
 
-Why the CNN doesn't run live: the CNN classifies over sequences of 100 consecutive flows, which only has meaning on the row-ordered CICIDS2017 CSV used for offline evaluation. Live per-flow capture provides no equivalent temporal window, so running the CNN live would feed it out-of-distribution input. It was trained, benchmarked, and documented, then intentionally excluded from the live path rather than shipped in a way that would silently misbehave in production.
+- `score = 0.5 × AE anomaly score + 0.5 × RF attack probability`
+- Override: AE confidence > **0.97** → AE decides alone; RF confidence > **0.90** → RF decides alone
+- An alert fires when the fused score exceeds **0.85**
 
-Model Performance
+The 0.97 / 0.90 overrides are coded defaults; `backend/src/calibrate_override.py` can replace them with values calibrated on benign traffic.
 
-The project's held-out DDoS/benign flow-level evaluation reports:
+### Why the CNN doesn't run live
 
-Model / path
+The CNN classifies sequences of 100 consecutive flows. That window only has meaning on the row-ordered CICIDS2017 CSV used for offline evaluation; live per-flow capture provides no equivalent temporal window, so feeding it live data would be out-of-distribution input. It was trained, benchmarked and documented, then deliberately kept out of the live path.
 
-Accuracy
+## Model performance
 
-Precision
+Held-out DDoS/benign flow-level evaluation:
 
-Recall
+| Model / path   | Accuracy | Precision | Recall | F1     | Role               |
+|----------------|---------:|----------:|-------:|-------:|--------------------|
+| Random Forest  | 99.75%   | 99.26%    | 99.74% | 99.50% | Live fusion        |
+| Autoencoder    | 78.87%   | 59.78%    | 48.88% | 53.78% | Live fusion        |
+| RF + AE fusion | 99.60%   | 98.90%    | 99.51% | 99.20% | Live decision path |
+| CNN            | 99.76%   | 99.12%    | 99.91% | 99.51% | Offline only       |
 
-F1
+- RF / AE / fusion results use the 45,149-row held-out flow-level test split (`backend/evaluate_ddos_heldout.py`).
+- The CNN result uses a separate 4,505-sequence subset (100-row windows, stride 10). It is **not** directly comparable to the flow-level rows.
+- These are experiment-specific results on one CICIDS2017 day (DDoS vs benign). They are not cross-dataset validation, not evidence for other CICIDS2017 attack families, and not a guarantee of live-network accuracy.
+- The live extractor produces the full 78-feature input contract, but exact numerical equivalence with the CICFlowMeter (Java) build that generated the training CSV has not been established.
 
-Role
+## Setup
 
-Random Forest
+### Prerequisites
 
-99.75%
+- Python 3.11
+- Node.js 20 LTS
+- Redis (local install on port 6379, **or** the Docker Compose service — see below)
+- Npcap (live packet capture on Windows)
 
-99.26%
+**Dataset:** CICIDS2017 is not included (too large for GitHub). Download `Friday-WorkingHours-Afternoon-DDoS.pcap_ISCX.csv` from the official CIC dataset page and place it in `backend/data/CICIDS2017/` if you plan to preprocess or retrain.
 
-99.74%
+**Configuration:** copy `.env.example` → `.env` (repo root, used by Docker Compose; must set `REDIS_PASSWORD`) and `backend/.env.example` → `backend/.env`.
 
-99.50%
+### Install dependencies
 
-Live fusion
-
-Autoencoder
-
-78.87%
-
-59.78%
-
-48.88%
-
-53.78%
-
-Live fusion
-
-RF + AE fusion
-
-99.60%
-
-98.90%
-
-99.51%
-
-99.20%
-
-Live decision path
-
-CNN
-
-99.76%
-
-99.12%
-
-99.91%
-
-99.51%
-
-Offline only
-
-The RF/AE/fusion results use the project's 45,149-row held-out flow-level test split. The CNN result uses a separate 4,505-sequence evaluation subset built with 100-row windows and stride 10. These are experiment-specific results, not guarantees of live-network accuracy.
-
-The live fusion path was validated on the held-out DDoS/benign split, but this is not independent cross-dataset validation or evidence for all CICIDS2017 attack families. The live extractor now produces the complete 78-feature input contract; exact numerical equivalence with the specific CICFlowMeter Java build/export configuration that generated the training CSV has not been established.
-
-Setup Instructions
-
-Prerequisites
-
-Python 3.11
-
-Node.js 20 LTS
-
-Redis (running locally on port 6379)
-
-Npcap (for live packet capture on Windows)
-
-Dataset: This repo does not include the CICIDS2017 dataset (too large for GitHub). Download Friday-WorkingHours-Afternoon-DDoS.pcap_ISCX.csv from the official CIC dataset page and place it in backend/data/CICIDS2017/ if you plan to preprocess or retrain.
-
-Install dependencies
-
+```bash
 # Backend
 cd backend
 pip install -r requirements.txt
-
+```
+```bash
 # Frontend
 cd frontend
 npm install
+```
 
-Option A — Use the pre-trained models (fastest)
+### Model artifacts
 
-Download autoencoder.h5, random_forest.pkl, cnn_classifier.h5, feature_scaler.pkl, and label_map.json from the repository Releases page (create this release before first use) and place them in backend/models/. Then skip to Running the system below.
+Trained model files (`*.h5`, `*.pkl`) are gitignored and are **not** in this repository. Generate them with the training steps below and keep them in `backend/models/`:
 
-Option B — Train from scratch
+`autoencoder.h5`, `random_forest.pkl`, `cnn_classifier.h5`, `feature_scaler.pkl`, `label_map.json`
 
+Live capture refuses to start without `random_forest.pkl` unless validated AE-only alerting is explicitly enabled.
+
+### Train from scratch
+
+```bash
 cd backend
-
-# 1. Preprocess dataset (first time only)
-python main.py --mode preprocess --dataset "data/CICIDS2017/Friday-WorkingHours-Afternoon-DDoS.pcap_ISCX.csv" --multiclass
-
+```
+```bash
+# 1. Preprocess the dataset (first time only)
+python main.py --mode preprocess --dataset "data/CICIDS2017/Friday-WorkingHours-Afternoon-DDoS.pcap_ISCX.csv"
+```
+```bash
 # 2. Train models
+#    Use run_training.py, not `main.py --mode train` — avoids a Windows joblib deadlock.
 python run_training.py
-# Use run_training.py, not main.py --mode train — avoids a Windows joblib deadlock.
-
-# 3. Evaluate model performance
+```
+```bash
+# 3. Evaluate
 python src/model_evaluation.py data/preprocessed/CICIDS2017_cleaned.csv
+```
 
-Running the system
+## Running the system
 
-# Start the backend
+### Local (without Docker)
+
+```bash
+# Dashboard + API (default mode is `dashboard`)
 cd backend
 python main.py
-
-# Start the frontend (separate terminal)
+```
+```bash
+# Packet capture + detection — separate terminal, Administrator required
+cd backend
+python main.py --mode ids --interface auto
+```
+```bash
+# React dev server — separate terminal
 cd frontend
 npm start
+```
 
-Dashboard available at localhost:3000 for React development (Docker serves it at localhost:5000).
+The React dev server runs at `http://localhost:3000`. Docker serves the built dashboard at `http://localhost:5000`.
 
-Live capture on Windows with Docker Desktop
+### Windows with Docker Desktop
 
-Start Redis and the dashboard with docker compose up --build. In another PowerShell window run ./start-capture.ps1; it requests Administrator access and connects host-side Scapy to Docker Redis. Npcap must be installed. Keep the capture window open. Only flows above the alert threshold appear in Threat Intel.
+```powershell
+docker compose up --build
+```
 
-Controlled live-lab capture and thesis evidence
+This starts Redis (published on `127.0.0.1:6380`, password-protected) and the dashboard (`127.0.0.1:5000`). Capture runs on the host, not in a container: in a second PowerShell window run
 
-Use this only on an isolated network containing systems you own: an attacker VM,
-a victim VM/service, and the sensor. verify_ensemble.py remains a synthetic
-fusion/plumbing check; its evidence is marked as synthetic and must not be
-presented as a live capture.
+```powershell
+.\start-capture.ps1
+```
 
-# Terminal 1: start Docker Redis + dashboard
-cd AI-Based-Intrusion-Detection-System-for-Real-Time-Network-Threat-Detection
-docker compose up
+It requests Administrator access and connects host-side Scapy to the Docker Redis. Npcap must be installed; keep the capture window open. Only flows above the alert threshold appear in Threat Intel. A demo helper is also available at `scripts\5-demo-threat-capture.bat`.
 
-Open the dashboard at http://localhost:5000.
+### Verify the pipeline (synthetic)
 
-# Terminal 2: Administrator PowerShell, keep this open.
-# -LiveLab marks evidence as controlled live-lab traffic; -FeatureDump records
-# the exact raw rows that must later be used for live-model training.
-cd AI-Based-Intrusion-Detection-System-for-Real-Time-Network-Threat-Detection
-.\start-capture.ps1 -LiveLab -FeatureDump .\backend\evidence\live_lab_features.csv
-
-Healthy capture logs include:
-
-CAPTURE_HEARTBEAT alive
-CAPTURE_HEALTH packets=... ipv4_tcp_udp=...
-DIAGNOSTIC recon_error=... anomaly_score=...
-
-Generate benign baseline traffic first, then only controlled scenarios against
-the isolated victim. Do not scan or flood public systems. Use the labelled
-feature dump and PCAP/event log to retrain into models/live_flow_v1/.
-
-Before enabling AE-only alerting, validate score variation:
-
-cd backend
-python validate_live_capture.py evidence\live_lab_features.csv --models models\live_flow_v1
-
-Only after that command passes, an operator may explicitly enable the
-AE-only path on a later capture with -EnableValidatedAeOnly. The default
-remains disabled.
-
-Confirm alerts and evidence:
-
-docker compose exec redis redis-cli XLEN ids:alerts
-Get-ChildItem .\backend\evidence | Sort-Object LastWriteTime -Descending | Select-Object -First 10
-
-Evidence is saved in backend\evidence\alerts.jsonl and backend\evidence\threat-*.png with an explicit origin (synthetic_fusion_verification, live_lab, or live_unclassified). Do not set IDS_AE_ONLY_ALERTING_VALIDATED=true until the validator passes and you have calibrated a live-lab model threshold.
-
-You can also start the demo helper from bat files\5-demo-threat-capture.bat.
-
-The AbuseIPDB credential previously committed to GitHub must be revoked and replaced. Put the replacement in backend/.env as ABUSEIPDB_API_KEY=... . The Settings page no longer submits or stores the key. Removing it from current files does not remove it from old Git commits.
-
-Verify the full pipeline
-
+```bash
 cd backend
 python verify_ensemble.py
+```
 
 Expected output:
 
+```
 RF predicted class=1 -> threat_name='DDoS' (P=1.0000)
 ALERTS RAISED: 3
   src=45.0.0.1  severity=CRITICAL  threat=DDoS  score=1.000
+```
 
-Run tests
+This is a synthetic fusion/plumbing check. Its evidence is labelled `synthetic_fusion_verification` and must not be presented as live capture.
 
+## Controlled live-lab capture
+
+> Use only on an isolated network of systems you own: an attacker VM, a victim VM/service, and the sensor. Do not scan or flood public systems.
+
+```powershell
+# Terminal 1: Docker Redis + dashboard (http://localhost:5000)
+docker compose up
+```
+```powershell
+# Terminal 2: Administrator PowerShell, keep open.
+# -LiveLab marks evidence as controlled live-lab traffic;
+# -FeatureDump records the raw feature rows for later live-model training.
+.\start-capture.ps1 -LiveLab -FeatureDump .\backend\evidence\live_lab_features.csv
+```
+
+Healthy capture logs include:
+
+```
+CAPTURE_HEARTBEAT alive
+CAPTURE_HEALTH packets=... ipv4_tcp_udp=...
+DIAGNOSTIC recon_error=... anomaly_score=...
+```
+
+Generate benign baseline traffic first, then only controlled scenarios against the isolated victim. Use the labelled feature dump and PCAP/event log to retrain into `models/live_flow_v1/`.
+
+Before enabling AE-only alerting, validate score variation:
+
+```powershell
+cd backend
+python validate_live_capture.py evidence\live_lab_features.csv --models models\live_flow_v1
+```
+
+Only after that passes, and after a live-lab threshold has been calibrated, may an operator enable the AE-only path on a later capture with `-EnableValidatedAeOnly` (sets `IDS_AE_ONLY_ALERTING_VALIDATED=true`). It is disabled by default.
+
+Confirm alerts and evidence:
+
+```powershell
+docker compose exec redis redis-cli --no-auth-warning -a <REDIS_PASSWORD from .env> XLEN ids:alerts
+Get-ChildItem .\backend\evidence | Sort-Object LastWriteTime -Descending | Select-Object -First 10
+```
+
+Evidence is written to `backend\evidence\alerts.jsonl` and `backend\evidence\threat-*.png`, each tagged with an origin: `synthetic_fusion_verification`, `live_lab`, or `live_unclassified`.
+
+## Tests
+
+```bash
 cd backend
 python -m pytest tests/ -v
+```
 
-The current suite contains 98 collected pytest items. The latest verified run passed all 98 items with 0 failures/errors. Two dependency deprecation warnings from Scapy/cryptography remain. Coverage includes preprocessing, sequence construction and leakage regression, live inference/fusion logic, flow scoring, route security, threat-intelligence privacy, whitelist behavior, and AutoBlock command behavior.
+Coverage areas: preprocessing, sequence construction and leakage regression, live inference/fusion logic, CICFlowMeter reference-fixture feature parity, flow scoring, route security and auth, threat-intelligence privacy, whitelist behaviour, and AutoBlock command behaviour. Two dependency deprecation warnings (Scapy/cryptography) are expected.
 
-Live Pipeline Benchmark
+## Live pipeline benchmark
 
-A controlled Windows/Python 3.11 CPU benchmark was run with the CNN excluded, matching the actual live architecture. For four-packet synthetic flows and batch size 1, the pipeline measured 98.15 ms median, 115.38 ms p95, and 121.41 ms p99 final-packet-to-prediction-processing latency. Sustained workload throughput was 4.95 completed flows/s, equivalent to 19.81 packets/s for this fixed four-packet synthetic workload. Redis XADD latency remained below 2.2 ms at p99 with zero Redis errors.
+`backend/benchmark_live_pipeline.py` — Windows, Python 3.11, CPU, CNN excluded (matching the live architecture), four-packet synthetic flows, batch size 1:
 
-These are workload-specific development measurements, not a maximum NIC capacity claim and not a benchmark for arbitrary packet sizes, flow lengths, traffic distributions, or enterprise-scale link speeds.
+| Metric | Result |
+|---|---|
+| Final-packet → prediction latency | 98.15 ms median / 115.38 ms p95 / 121.41 ms p99 |
+| Sustained throughput | 4.95 flows/s (19.81 packets/s for this workload) |
+| Redis `XADD` latency | < 2.2 ms p99, zero errors |
 
-Redis and Persistence
+These are workload-specific development measurements — not a NIC capacity claim, and not representative of arbitrary flow lengths, traffic mixes, or enterprise link speeds.
 
-Redis Streams provide the real-time alert transport and bounded dashboard history. The audited deployment uses Redis RDB persistence but does not enable AOF, and the alert stream is bounded (MAXLEN ~5000). The published Redis port is localhost-only in the audited Docker configuration and authentication is enabled. Redis should therefore be treated as the live alert broker and short-term/bounded alert buffer, not as a dedicated durable SIEM or evidence database.
+## Redis and persistence
 
-Automated Blocking
+Redis Streams carry real-time alerts and a bounded dashboard history (`ids:alerts`, `MAXLEN ~5000`). The Docker configuration enables RDB persistence but not AOF, binds the published port to localhost only, and requires a password. Treat Redis as a live alert broker and short-term buffer, not a durable SIEM or evidence store.
 
-Optional automated IP blocking is restricted to CRITICAL alerts and guarded by whitelist, direction, TCP/SYN, local-destination, and configuration checks. Linux IDS-created rules are tagged for ownership and persistent state is used for reconciliation/TTL cleanup. Firewall command execution is regression-tested with mocks; comprehensive production firewall-policy safety across deployment environments has not been established. The default deployment should keep high-privilege firewall access disabled unless explicitly required and reviewed.
+## Automated blocking
 
-Docker
+Optional automated IP blocking is restricted to CRITICAL alerts and gated by whitelist, direction, TCP/SYN, local-destination, and configuration checks. IDS-created Linux rules are tagged for ownership, and persistent state drives reconciliation/TTL cleanup. Firewall command execution is regression-tested with mocks only; production firewall-policy safety across environments has not been established. Keep high-privilege firewall access (`NET_ADMIN`) disabled unless explicitly required and reviewed.
 
-docker compose up --build
+## Security notice
 
-Team
+An AbuseIPDB API key was previously committed to this repository and remains in Git history. It must be revoked and replaced. Put the replacement in `backend/.env` as `ABUSEIPDB_API_KEY=...`; the Settings page no longer submits or stores the key.
 
-Completed as a Final Year Project (FYP-II) at the Institute of Computer Sciences & Information Technology, The University of Agriculture, Peshawar, supervised by Mr. Yasir Ahmed. Team: Visal Sattar, Khayal Baz Khalil, Shayan Khan. Primary engineering, model development, and system architecture by Visal Sattar.
+## Team
+
+Completed as a Final Year Project (FYP-II) at the Institute of Computer Sciences & Information Technology, The University of Agriculture, Peshawar, supervised by Mr. Yasir Ahmed.
+
+Team: Visal Sattar, Khayal Baz Khalil, Shayan Khan. Primary engineering, model development, and system architecture by Visal Sattar.
