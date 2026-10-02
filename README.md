@@ -300,7 +300,7 @@ Optional automated IP blocking is restricted to CRITICAL alerts and gated by whi
 
 ## Dashboard access
 
-By default the dashboard binds to `127.0.0.1` and needs no token. Before exposing it on a network, set `IDS_API_TOKEN` in the root `.env`. Every `/api/` request (reads included) and every Socket.IO connection then needs it; only `/api/health` stays open. Open the dashboard once as `http://<host>:5000/?token=<IDS_API_TOKEN>`. The token is saved in the browser and removed from the URL. This is a shared secret, not user login. For real authentication, put the dashboard behind a reverse proxy.
+By default the dashboard binds to `127.0.0.1` and needs no token. Before exposing it on a network, set `IDS_API_TOKEN` in the root `.env`. Every `/api/` request (reads included) and every Socket.IO connection then needs it; only `/api/health` stays open. Open the dashboard once as `http://<host>:5000/?token=<IDS_API_TOKEN>`. The token is saved in the browser and removed from the URL. On the machine that holds `.env`, `.\open-dashboard.ps1` does this for you. This is a shared secret, not user login. For real authentication, put the dashboard behind a reverse proxy.
 
 ## Security notice
 
