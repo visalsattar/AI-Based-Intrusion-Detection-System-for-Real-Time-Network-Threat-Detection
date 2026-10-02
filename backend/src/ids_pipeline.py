@@ -403,6 +403,7 @@ class RealTimeIDSPipeline:
 
         self.recon_threshold, self._threshold_calibrated = self._load_recon_threshold(model_path)
         self.AE_OVERRIDE_CONF, self.RF_OVERRIDE_CONF = self._load_override_confs(model_path)
+        self.RF_MIN_SRC_RATE, self.RATE_FLOOD_CONN_PER_S = self._load_rate_thresholds()
 
         # AE-only detection is intentionally opt-in (requires live-lab validation).
         self.ae_only_alerting_validated = (
@@ -471,6 +472,35 @@ class RealTimeIDSPipeline:
             f"meaningless until you run `python src/model_evaluation.py <preprocessed_csv>`."
         )
         return fallback, False
+
+    @classmethod
+    def _load_rate_thresholds(cls, env=None):
+        """IDS_RF_MIN_SRC_RATE / IDS_RATE_FLOOD_CONN_PER_S override the measured defaults so a
+        site can calibrate them (backend/calibrate_rate.py). Invalid values fall back to the
+        defaults with a warning; the flood threshold may not be below the RF gate."""
+        env = os.environ if env is None else env
+        def read(name, default):
+            raw = (env.get(name) or "").strip()
+            if not raw:
+                return default
+            try:
+                v = float(raw)
+                if v > 0:
+                    return v
+            except ValueError:
+                pass
+            logger.warning(f"Ignoring invalid {name}={raw!r}; using {default}")
+            return default
+        gate = read("IDS_RF_MIN_SRC_RATE", cls.RF_MIN_SRC_RATE)
+        flood = read("IDS_RATE_FLOOD_CONN_PER_S", cls.RATE_FLOOD_CONN_PER_S)
+        if flood < gate:
+            logger.warning(f"IDS_RATE_FLOOD_CONN_PER_S={flood} is below the RF gate {gate}; "
+                           f"using defaults {cls.RF_MIN_SRC_RATE}/{cls.RATE_FLOOD_CONN_PER_S}")
+            return cls.RF_MIN_SRC_RATE, cls.RATE_FLOOD_CONN_PER_S
+        if (gate, flood) != (cls.RF_MIN_SRC_RATE, cls.RATE_FLOOD_CONN_PER_S):
+            logger.info(f"Connection-rate thresholds from environment: RF gate {gate}/s, "
+                        f"flood alert {flood}/s")
+        return gate, flood
 
     @classmethod
     def _load_override_confs(cls, model_path: str):

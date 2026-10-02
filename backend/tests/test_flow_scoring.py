@@ -518,3 +518,24 @@ def test_udp_flows_do_not_count_toward_the_connection_rate(pipe):
         feed(pipe, IP(src="10.0.0.7", dst="10.0.0.53") / UDP(sport=40000 + i, dport=53))
     feed(pipe, tcp("10.0.0.7", "10.0.0.5", 5555, 80, "S"))
     assert pipe._source_rate("10.0.0.7", time.time()) == pytest.approx(1 / pipe.RATE_WINDOW_S, abs=0.01)
+
+
+@pytest.mark.parametrize("env,expected", [
+    ({}, (10.0, 30.0)),                                                    # measured defaults
+    ({"IDS_RF_MIN_SRC_RATE": "20", "IDS_RATE_FLOOD_CONN_PER_S": "80"}, (20.0, 80.0)),
+    ({"IDS_RF_MIN_SRC_RATE": "abc"}, (10.0, 30.0)),                        # invalid -> default
+    ({"IDS_RF_MIN_SRC_RATE": "-5"}, (10.0, 30.0)),                         # non-positive -> default
+    ({"IDS_RF_MIN_SRC_RATE": "50", "IDS_RATE_FLOOD_CONN_PER_S": "40"}, (10.0, 30.0)),  # flood < gate
+])
+def test_rate_thresholds_are_configurable_and_validated(env, expected):
+    assert RealTimeIDSPipeline._load_rate_thresholds(env) == expected
+
+
+def test_calibrate_rate_recommends_margins_over_the_normal_peak(tmp_path):
+    import calibrate_rate
+    rows = [{"ts": 1000 + i * 0.1, "src_ip": "10.0.0.2", "protocol": 6} for i in range(80)]  # 8/s
+    rows += [{"ts": 1000 + i, "src_ip": "10.0.0.3", "protocol": 17} for i in range(500)]     # UDP ignored
+    path = tmp_path / "normal.csv"
+    __import__("pandas").DataFrame(rows).to_csv(path, index=False)
+    peaks = calibrate_rate.peak_rates(__import__("pandas").read_csv(path), 10.0)
+    assert peaks == {"10.0.0.2": 8.0}

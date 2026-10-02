@@ -316,6 +316,9 @@ const Settings = () => {
                         ? 'Not trained'
                         : 'Unknown'}
               </span>
+              {modelStatus?.random_forest_source && (
+                <span className="label" style={{ marginTop: 4 }}>RF: {modelStatus.random_forest_source}</span>
+              )}
             </div>
             <div className="summary-card">
               <span className="label">Geolocation DB</span>

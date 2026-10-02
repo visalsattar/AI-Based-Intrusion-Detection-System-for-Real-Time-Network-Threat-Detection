@@ -41,6 +41,9 @@ services:
       - REDIS_HOST=redis
       - REDIS_PASSWORD=${REDIS_PASSWORD}
       - IDS_API_TOKEN=${IDS_API_TOKEN:-}
+      # Same RF directory as the host capture (start-capture.ps1 reads it too), so the
+      # dashboard's model status describes the model actually scoring traffic.
+      - IDS_RF_DIR=${IDS_RF_DIR:-}
       # The container binds 0.0.0.0 internally; the port above is published on host
       # loopback only, so running without a token is an explicit, scoped choice.
       # Remove this line (and set IDS_API_TOKEN) before publishing beyond 127.0.0.1.

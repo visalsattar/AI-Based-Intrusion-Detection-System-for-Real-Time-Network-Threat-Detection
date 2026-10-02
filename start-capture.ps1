@@ -61,6 +61,11 @@ $env:IDS_EVIDENCE_ORIGIN = if ($LiveLab) { 'live_lab' } else { 'live_unclassifie
 # Never enable AE-only alerting just because capture started. Enable it only
 # after validate_live_capture.py passes on a labelled controlled-lab capture.
 $env:IDS_AE_ONLY_ALERTING_VALIDATED = if ($EnableValidatedAeOnly) { 'true' } else { 'false' }
+if (-not $RfDir) {
+    # Default from the root .env, so the capture and the dashboard (docker-compose) agree.
+    $rfLine = Get-Content -LiteralPath $envFile | Where-Object { $_ -match '^\s*IDS_RF_DIR\s*=' } | Select-Object -First 1
+    if ($rfLine) { $RfDir = ($rfLine -replace '^\s*IDS_RF_DIR\s*=\s*', '').Trim().Trim('"').Trim("'") }
+}
 if ($RfDir) {
     if (-not (Test-Path -LiteralPath (Join-Path $root "backend\models\$RfDir\random_forest.pkl"))) {
         throw "No random_forest.pkl in backend\models\$RfDir. Train it first (backend\train_live_flow.py)."

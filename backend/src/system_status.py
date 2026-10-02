@@ -31,6 +31,13 @@ RF_PATH = os.path.join(_MODELS, "random_forest.pkl")
 REAL_METRICS_PATH = os.path.join(_MODELS, "real_metrics.json")
 OVERRIDE_PATH = os.path.join(_MODELS, "override_calibration.json")
 
+
+def _rf_path() -> str:
+    """The RF the capture uses: models/<IDS_RF_DIR>/random_forest.pkl when IDS_RF_DIR is set
+    (same variable the pipeline reads), else the shipped models/random_forest.pkl."""
+    rf_dir = os.environ.get("IDS_RF_DIR", "").strip()
+    return os.path.join(_MODELS, rf_dir, "random_forest.pkl") if rf_dir else RF_PATH
+
 # Keep in sync with RealTimeIDSPipeline.AE_OVERRIDE_CONF / RF_OVERRIDE_CONF and
 # scoring.OVERRIDE_FLOOR. Duplicated here so the dashboard process does not import
 # TensorFlow just to render a status panel.
@@ -95,7 +102,8 @@ def _offline_metrics(real_metrics) -> dict:
 def get_model_status() -> dict:
     ae = os.path.exists(MODEL_PATH)
     scaler = os.path.exists(SCALER_PATH)
-    rf = os.path.exists(RF_PATH)
+    rf_path = _rf_path()
+    rf = os.path.exists(rf_path)
 
     if not (ae and scaler):
         missing = [n for n, ok in (("models/autoencoder.h5", ae),
@@ -113,6 +121,7 @@ def get_model_status() -> dict:
     overrides = _override_status()
     common = {
         "random_forest_present": rf,
+        "random_forest_source": os.environ.get("IDS_RF_DIR", "").strip() or "shipped (CICIDS2017)",
         "calibrated": calibrated,
         "recon_threshold": recon_threshold,
         "override_thresholds": overrides,

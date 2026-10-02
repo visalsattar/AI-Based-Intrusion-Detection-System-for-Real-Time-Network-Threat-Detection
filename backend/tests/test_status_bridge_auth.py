@@ -19,6 +19,7 @@ def models(tmp_path, monkeypatch):
                        ("OVERRIDE_PATH", "override_calibration.json")):
         monkeypatch.setattr(system_status, attr, str(d / name))
     monkeypatch.delenv("IDS_AE_ONLY_ALERTING_VALIDATED", raising=False)
+    monkeypatch.delenv("IDS_RF_DIR", raising=False)
 
     def make(*names, metrics=None, overrides=None):
         for n in names:
@@ -182,3 +183,17 @@ def test_socket_auth_with_token(auth, ok):
 
 def test_socket_auth_open_when_no_token_configured():
     assert _socket_authorized()(None, "") is True
+
+def test_status_follows_ids_rf_dir(models, monkeypatch, tmp_path):
+    """The dashboard must describe the RF the capture uses (IDS_RF_DIR), not always the shipped one."""
+    import system_status
+    models("autoencoder.h5", "feature_scaler.pkl", metrics=CAL)          # no shipped RF
+    monkeypatch.setattr(system_status, "_MODELS", str(tmp_path))
+    (tmp_path / "live_flow_v3").mkdir()
+    (tmp_path / "live_flow_v3" / "random_forest.pkl").write_bytes(b"x")
+    monkeypatch.setenv("IDS_RF_DIR", "live_flow_v3")
+    s = system_status.get_model_status()
+    assert s["random_forest_present"] is True
+    assert s["random_forest_source"] == "live_flow_v3"
+    monkeypatch.delenv("IDS_RF_DIR")
+    assert system_status.get_model_status()["random_forest_source"] == "shipped (CICIDS2017)"
