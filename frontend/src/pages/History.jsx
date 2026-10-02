@@ -162,6 +162,7 @@ const History = () => {
                 <th>Timestamp</th>
                 <th>Threat Type</th>
                 <th>Source IP</th>
+                <th>Target</th>
                 <th>Location</th>
                 <th>Protocol</th>
                 <th>Anomaly Score</th>
@@ -174,6 +175,8 @@ const History = () => {
                   <td>{formatTimestamp(a.timestamp)}</td>
                   <td>{a.threat_type || 'Unknown'}</td>
                   <td>{a.src_ip || a.flow_key || 'Unknown'}</td>
+                  {/* dst_port added 2 Oct 2026; older alerts show the IP only */}
+                  <td>{a.dst_ip ? `${a.dst_ip}${a.dst_port != null ? `:${a.dst_port}` : ''}` : '—'}</td>
                   <td>{getLocationLabel(a)}</td>
                   <td>{a.protocol || '—'}</td>
                   <td>{typeof a.anomaly_score === 'number' ? `${(a.anomaly_score * 100).toFixed(1)}%` : '—'}</td>

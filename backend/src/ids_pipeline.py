@@ -10,6 +10,7 @@ from scapy.all import AsyncSniffer, sniff, IP, TCP, UDP
 import subprocess
 import json
 import time
+from collections import deque
 import ipaddress
 import threading
 import heapq
@@ -272,6 +273,18 @@ class RealTimeIDSPipeline:
     # 81.5 min / 2,695 flows of live laptop traffic.
     RF_ALERT_CONF = 0.70
     RF_MODERATE_SEVERITY = "MEDIUM"
+
+    # Per-source connection RATE. Per-flow features cannot express "how many connections per
+    # second": one flood connection looks like one normal request (2 Oct 2026: live_flow_v2
+    # flagged 99% of human-paced GETs). Measured peak new connections/s per source (10 s window):
+    # normal laptop use <= 4.3, normal WSL use <= 2.5; Wi-Fi lab flood 87, WSL flood 247,
+    # CICIDS2017 DDoS replay 116. Counts new TCP connections only (UDP/DNS excluded).
+    #  * RF-driven verdicts (RF P(attack) > 0.5) only alert from a source >= RF_MIN_SRC_RATE.
+    #  * A source >= RATE_FLOOD_CONN_PER_S alerts by itself, model-independent, at HIGH.
+    RATE_WINDOW_S = 10.0
+    RF_MIN_SRC_RATE = 10.0
+    RATE_FLOOD_CONN_PER_S = 30.0
+    RATE_FLOOD_SEVERITY = "HIGH"
 
     # In the CICIDS2017 Friday CSV these flag columns only ever hold 0 or 1 (scaler max = 1),
     # i.e. flag *presence*, whereas BasicFlow.java and _extract_flow_features count packets
@@ -599,6 +612,10 @@ class RealTimeIDSPipeline:
             i_src, i_sport, i_dst, i_dport = src_ip, src_port, dst_ip, dst_port
             if is_tcp and (fl & 0x12) == 0x12:
                 i_src, i_sport, i_dst, i_dport = dst_ip, dst_port, src_ip, src_port
+            if is_tcp:
+                # TCP only: on the CICIDS2017 replay, busy workstations sent 34-57 DNS (UDP)
+                # queries/s, which a combined count turned into 5,577 false rate alerts.
+                self._note_new_flow(i_src, ts)
             flow = self.flow_tracker[flow_key] = {
                 'packets': 0,
                 'bytes': 0,
@@ -1176,6 +1193,27 @@ class RealTimeIDSPipeline:
 
     # ------------------------------------------------------------------ fusion / alerting
 
+    def _note_new_flow(self, src, ts):
+        """Record a new connection from `src` at packet time `ts` (seconds)."""
+        if not hasattr(self, "_src_flow_times"):
+            self._src_flow_times = {}
+        q = self._src_flow_times.setdefault(src, deque())
+        q.append(ts)
+        cutoff = ts - self.RATE_WINDOW_S
+        while q and q[0] < cutoff:
+            q.popleft()
+        if len(self._src_flow_times) > 50000:              # bound memory: drop idle sources
+            self._src_flow_times = {k: v for k, v in self._src_flow_times.items()
+                                    if v and v[-1] >= cutoff}
+
+    def _source_rate(self, src, now_ts):
+        """New connections per second from `src` over the last RATE_WINDOW_S seconds."""
+        q = getattr(self, "_src_flow_times", {}).get(src)
+        if not q:
+            return 0.0
+        cutoff = now_ts - self.RATE_WINDOW_S
+        return sum(1 for t in q if t >= cutoff) / self.RATE_WINDOW_S
+
     def _process_prediction(self, flow_key, recon_error: float,
                             rf_attack_prob: float = None,
                             threat_name: str = None):
@@ -1247,12 +1285,28 @@ class RealTimeIDSPipeline:
             )
 
         rf_moderate = override_reason == 'random forest (moderate confidence)'
-        if anomaly_score > alert_cutoff or rf_moderate:
+        alerting = anomaly_score > alert_cutoff or rf_moderate
+
+        # Rate context (see RATE_* constants). Packet time, so replay and live agree.
+        src_rate = self._source_rate(src_ip, flow['last_seen'].timestamp())
+        ae_led = bool(override_reason and override_reason.startswith('autoencoder override'))
+        rf_driven = rf_attack_prob is not None and rf_attack_prob > 0.5 and not ae_led
+        if alerting and rf_driven and src_rate < self.RF_MIN_SRC_RATE:
+            # The RF names a flood/DDoS pattern, but this source is not flooding.
+            self._rate_gated = getattr(self, "_rate_gated", 0) + 1
+            alerting = False
+        rate_flood = (not alerting) and src_rate >= self.RATE_FLOOD_CONN_PER_S
+        if rate_flood:
+            override_reason = 'connection-rate flood'
+
+        if alerting or rate_flood:
             severity = self._compute_severity(anomaly_score, settings)
-            if override_reason and override_reason.startswith('autoencoder override'):
+            if ae_led:
                 severity = self.AE_OVERRIDE_MAX_SEVERITY
             if rf_moderate:
                 severity = self.RF_MODERATE_SEVERITY
+            if rate_flood:
+                severity = self.RATE_FLOOD_SEVERITY
 
             # Cooldown per (source, severity), not per port (port scans rotate ports).
             k = (src_ip, severity)
@@ -1278,11 +1332,19 @@ class RealTimeIDSPipeline:
                     else 'ensemble (autoencoder + random forest)'
                     if rf_attack_prob is not None else 'autoencoder only'
                 ),
-                'threat_type': threat_name if threat_name and threat_name != 'Benign'
+                # An AE-led alert must not borrow the RF's attack name (live test 2 Oct 2026:
+                # a normal download alerted by the AE was labelled "TCP Connect Flood").
+                'threat_type': threat_name if threat_name and threat_name != 'Benign' and not ae_led
+                               else 'Connection Flood (rate)' if rate_flood
                                else 'Network Anomaly',
+                # New connections/s from this source over RATE_WINDOW_S at scoring time.
+                'src_conn_rate': round(src_rate, 1),
                 'severity': severity,
                 'src_ip': src_ip,
                 'dst_ip': flow.get('init_dst', flow_key[1][0]),
+                # Port of the initiator's destination (the service hit): makes an alert
+                # attributable without a packet capture (e.g. :8080 flood vs WSL control traffic).
+                'dst_port': flow.get('init_dport'),
                 'protocol': 'TCP' if flow['protocol'] == 6 else 'UDP',
                 'packet_count': flow['packets'],
                 'bytes_transferred': flow['bytes'],

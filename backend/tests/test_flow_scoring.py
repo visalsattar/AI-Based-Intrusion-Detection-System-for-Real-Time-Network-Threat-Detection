@@ -419,6 +419,8 @@ class _BinaryRF:
 def test_binary_rf_uses_label_map_name_only_when_rf_says_attack(pipe, p_attack, expected):
     pipe.random_forest, pipe._label_map = _BinaryRF(p_attack), {0: "Benign", 1: "Lab Flood"}
     pipe.autoencoder.delta = 0.9                       # AE high -> an alert fires either way
+    for i in range(200):                               # 8.8.4.4 is flooding (rate gate)
+        pipe._note_new_flow("8.8.4.4", time.time() - i * 0.01)
     feed(pipe, tcp("8.8.4.4", "10.0.0.5", 4444, 80, "S"), tcp("8.8.4.4", "10.0.0.5", 4444, 80, "FA"))
     pipe._inference_batch()
     assert pipe.redis_client.alerts()[0]["threat_type"] == expected
@@ -499,3 +501,20 @@ def test_active_stats_are_zero_without_an_idle_gap(pipe):
     key = next(iter(pipe.flow_tracker))
     f = dict(zip(FEATURE_ORDER, pipe._extract_flow_features(key)))
     assert f["Idle Mean"] == 0 and f["Active Mean"] == 0 and f["Active Max"] == 0
+
+
+def test_alert_names_the_targeted_port(pipe):
+    """dst_port lets an operator tell e.g. a :8080 flood from WSL/host control traffic."""
+    pipe.autoencoder.delta = 0.9
+    feed(pipe, tcp("8.8.4.4", "10.0.0.5", 4444, 8080, "S"), tcp("8.8.4.4", "10.0.0.5", 4444, 8080, "FA"))
+    pipe._inference_batch()
+    alert = pipe.redis_client.alerts()[0]
+    assert (alert["dst_ip"], alert["dst_port"]) == ("10.0.0.5", 8080)
+
+
+def test_udp_flows_do_not_count_toward_the_connection_rate(pipe):
+    """CICIDS replay: workstations' DNS bursts (UDP) must not look like a connection flood."""
+    for i in range(50):
+        feed(pipe, IP(src="10.0.0.7", dst="10.0.0.53") / UDP(sport=40000 + i, dport=53))
+    feed(pipe, tcp("10.0.0.7", "10.0.0.5", 5555, 80, "S"))
+    assert pipe._source_rate("10.0.0.7", time.time()) == pytest.approx(1 / pipe.RATE_WINDOW_S, abs=0.01)

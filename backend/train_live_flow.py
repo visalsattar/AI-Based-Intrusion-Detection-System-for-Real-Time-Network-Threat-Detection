@@ -83,6 +83,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--attack", nargs="*", default=[], help="captures containing labelled attack flows")
     ap.add_argument("--benign", nargs="*", default=[], help="captures of benign-only traffic")
+    ap.add_argument("--benign-from-attacker", nargs="*", default=[],
+                    help="benign captures made FROM the attacker host (e.g. normal-paced requests from "
+                         "the same WSL VM); every flow is labelled benign, no attacker-IP check")
     ap.add_argument("--evaluate", nargs="*", default=[], help="NEW capture(s) to score with a trained model")
     ap.add_argument("--attacker-ip", required=True, nargs="+",
                     help="one or more attacker IPs (e.g. a LAN device and a WSL VM)")
@@ -114,6 +117,8 @@ def main(argv=None):
         if (d.src_ip.isin(args.attacker_ip) | d.dst_ip.isin(args.attacker_ip)).any():
             raise SystemExit(f"{f} contains attacker traffic; it is not benign-only")
         parts.append(d.assign(y=0, source=f))
+    for f in args.benign_from_attacker:
+        parts.append(pd.read_csv(f).assign(y=0, source=f))
     if not parts:
         raise SystemExit("give --attack and/or --benign captures")
 
@@ -137,7 +142,7 @@ def main(argv=None):
     with open(os.path.join(args.out, "label_map.json"), "w", encoding="utf-8") as fh:
         json.dump({"0": "Benign", "1": args.attack_name}, fh, indent=2)
     meta = {"created": time.strftime("%Y-%m-%d %H:%M:%S"), "attack_captures": args.attack,
-            "benign_captures": args.benign, "attacker_ip": args.attacker_ip,
+            "benign_captures": args.benign, "benign_from_attacker": args.benign_from_attacker, "attacker_ip": args.attacker_ip,
             "target_port": args.target_port, "train_rows": int(len(train)),
             "train_attack": int(train.y.sum()), "shortcut_features_zeroed": list(SHORTCUT_FEATURES),
             "preprocessing": "TRAINING_ZERO/BINARY_FEATURES + models/feature_scaler.pkl (same as live)",

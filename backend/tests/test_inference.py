@@ -14,6 +14,7 @@ present (e.g. a fresh clone before training).
 """
 import json
 import os
+import time
 
 import numpy as np
 import pytest
@@ -64,8 +65,16 @@ def pipeline():
 def _isolate_pipeline(pipeline, monkeypatch):
     """Pin every on-disk input the alert path reads, so results don't depend on local files."""
     pipeline._last_alert.clear()
+    pipeline._src_flow_times = {}            # module-scoped pipeline: no rate carry-over
     monkeypatch.setattr(pipeline, "recon_threshold", 0.01)   # ae_score(1.0) = 0.99
     monkeypatch.setattr(pipeline, "_load_settings", lambda: {"sensitivity": "medium", "autoBlock": False})
+
+
+def _flooding(pipeline, src="10.0.0.5", n=200):
+    """Make `src` look like it opened n connections in the last 2 s (rate gate, RATE_* constants)."""
+    now = time.time()
+    for i in range(n):
+        pipeline._note_new_flow(src, now - i * 0.01)
 
 
 def _make_flow(pipeline, src="10.0.0.5", dst="10.0.0.9", sport=44444, dport=80, n=4):
@@ -225,6 +234,7 @@ def test_fusion_averages_when_neither_model_overrides(pipeline):
     """
     pipeline.redis_client = FakeRedis()
     flow_key = _make_flow(pipeline)
+    _flooding(pipeline)                  # RF verdicts need a source that is actually flooding
 
     # recon_error == threshold -> ae_score == 0.5 exactly; rf = 0.6.
     # Neither exceeds its override (AE 0.97 / RF 0.90) -> fused = 0.55.
@@ -288,6 +298,7 @@ def test_moderate_rf_alone_alerts_at_medium_and_never_autoblocks(pipeline, monke
     monkeypatch.setattr(pipeline, "_should_block", lambda flow: True)
     monkeypatch.setattr(pipeline, "_block", blocked.append)
     flow_key = _make_flow(pipeline)
+    _flooding(pipeline)                  # RF verdicts need a source that is actually flooding
 
     pipeline._process_prediction(flow_key, recon_error=0.0001, rf_attack_prob=0.75)
 
@@ -343,6 +354,7 @@ def test_rf_confirmed_attack_still_reaches_critical_and_autoblock(pipeline, monk
     monkeypatch.setattr(pipeline, "_should_block", lambda flow: True)
     monkeypatch.setattr(pipeline, "_block", blocked.append)
     flow_key = _make_flow(pipeline)
+    _flooding(pipeline)                  # RF verdicts need a source that is actually flooding
 
     pipeline._process_prediction(flow_key, recon_error=1000.0, rf_attack_prob=0.99)
 
@@ -355,6 +367,7 @@ def test_rf_override_confirms_known_attack(pipeline):
     """A very confident RF (P(attack) > 0.90) must alert even if the AE is calm."""
     pipeline.redis_client = FakeRedis()
     flow_key = _make_flow(pipeline)
+    _flooding(pipeline)                  # RF verdicts need a source that is actually flooding
 
     # recon_error 0 -> ae_score 0 (AE calm); RF very confident it's an attack.
     pipeline._process_prediction(flow_key, recon_error=0.0, rf_attack_prob=0.95)
@@ -380,3 +393,52 @@ def test_done_flow_is_scored_once_and_removed(pipeline):
     pipeline.packet_buffer.append((key, None))
     pipeline._inference_batch()
     assert key not in pipeline.flow_tracker
+
+# - per-source connection-rate rules (RATE_* constants; 2 Oct 2026)
+
+def test_rf_verdict_from_a_quiet_source_does_not_alert(pipeline):
+    """live_flow_v2 flagged 99% of human-paced GETs: one RF-positive connection is not a flood."""
+    pipeline.redis_client = FakeRedis()
+    gated_before = getattr(pipeline, "_rate_gated", 0)
+    flow_key = _make_flow(pipeline)                       # a single connection, no flood
+    pipeline._process_prediction(flow_key, recon_error=0.0001, rf_attack_prob=0.99)
+    assert pipeline.redis_client.alerts() == []
+    assert pipeline._rate_gated == gated_before + 1
+
+
+def test_high_connection_rate_alerts_without_any_model(pipeline):
+    pipeline.redis_client = FakeRedis()
+    flow_key = _make_flow(pipeline)
+    _flooding(pipeline, n=400)                            # ~40 conn/s over the 10 s window
+    pipeline._process_prediction(flow_key, recon_error=0.0001, rf_attack_prob=0.05)
+    alert = pipeline.redis_client.alerts()[0]
+    assert alert["detection_source"] == "connection-rate flood"
+    assert alert["threat_type"] == "Connection Flood (rate)"
+    assert alert["severity"] == "HIGH"
+    assert alert["src_conn_rate"] >= pipeline.RATE_FLOOD_CONN_PER_S
+
+
+def test_moderate_rate_below_flood_threshold_raises_nothing_on_its_own(pipeline):
+    pipeline.redis_client = FakeRedis()
+    flow_key = _make_flow(pipeline)
+    _flooding(pipeline, n=150)                            # 15 conn/s: above RF gate, below flood rule
+    pipeline._process_prediction(flow_key, recon_error=0.0001, rf_attack_prob=0.05)
+    assert pipeline.redis_client.alerts() == []
+
+
+def test_source_rate_counts_only_the_window():
+    p = RealTimeIDSPipeline.__new__(RealTimeIDSPipeline)
+    for t in (0.0, 1.0, 2.0, 50.0):
+        p._note_new_flow("1.2.3.4", t)
+    assert p._source_rate("1.2.3.4", 50.0) == pytest.approx(1 / p.RATE_WINDOW_S)
+    assert p._source_rate("9.9.9.9", 50.0) == 0.0
+
+
+def test_ae_led_alert_does_not_borrow_the_rf_attack_name(pipeline):
+    pipeline.redis_client = FakeRedis()
+    flow_key = _make_flow(pipeline)
+    # AE screaming (override), RF mildly positive and naming an attack class.
+    pipeline._process_prediction(flow_key, recon_error=1000.0, rf_attack_prob=0.6, threat_name="DDoS")
+    alert = pipeline.redis_client.alerts()[0]
+    assert alert["detection_source"].startswith("autoencoder override")
+    assert alert["threat_type"] == "Network Anomaly"
