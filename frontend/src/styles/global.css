@@ -47,3 +47,17 @@ a:focus-visible {
   outline: 2px solid var(--data);
   outline-offset: 2px;
 }
+
+/* Shown when the backend answers 401 (IDS_API_TOKEN set, browser has no valid token). */
+.auth-banner {
+  margin: 0 0 16px;
+  padding: 12px 16px;
+  border: 1px solid var(--warn);
+  border-radius: 8px;
+  background: rgba(251, 191, 36, 0.08);
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.5;
+}
+.auth-banner strong { color: var(--warn); }
+.auth-banner code { font-size: 13px; overflow-wrap: anywhere; }

@@ -38,6 +38,7 @@ def test_main_module_imports_cleanly(mode):
         "REDIS_PORT": "1",          # refused instantly instead of a connect timeout
         "TF_CPP_MIN_LOG_LEVEL": "3",
         "IDS_API_TOKEN": "",
+        "IDS_LOG_DIR": __import__("tempfile").mkdtemp(prefix="ids_test_logs_"),
     }
     r = subprocess.run(
         [sys.executable, "-c",

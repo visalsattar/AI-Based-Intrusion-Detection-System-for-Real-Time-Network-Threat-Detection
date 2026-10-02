@@ -16,6 +16,7 @@ import { MapContainer, TileLayer, CircleMarker, Popup } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 import { Laptop, Search, FileDown, RefreshCw } from 'lucide-react';
 import AlertTable from '../components/AlertTable';
+import { useAuthRequired } from '../components/AuthBanner';
 import { AttackDonut, NetworkTrafficChart } from '../components/TrafficCharts';
 
 // With IDS_API_TOKEN set, the backend refuses sockets without auth.token (main.py
@@ -187,6 +188,7 @@ const Dashboard = () => {
   const mappable = alerts.filter(a => a.location?.lat != null && a.location?.lon != null);
   const healthStale = sysHealth.status === 'unreachable';
   const healthLabel = healthNote(sysHealth);
+  const authRequired = useAuthRequired();
 
   const handleExportLogs = () => downloadJSON(alerts, `ids-alerts-${Date.now()}.json`);
 
@@ -201,7 +203,7 @@ const Dashboard = () => {
         </h1>
         <div className={`status ${isConnected ? 'connected' : 'disconnected'}`}>
           <PulseLine connected={isConnected} />
-          {isConnected ? 'Connected' : 'Disconnected'}
+          {isConnected ? 'Connected' : authRequired ? 'Token required' : 'Disconnected'}
         </div>
       </header>
 

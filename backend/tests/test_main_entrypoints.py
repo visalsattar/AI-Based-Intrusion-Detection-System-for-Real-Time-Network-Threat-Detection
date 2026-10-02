@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 
 BACKEND = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -19,7 +20,8 @@ def _run_main_script(body, **env):
     r = subprocess.run(
         [sys.executable, "-c", script], cwd=BACKEND, capture_output=True, text=True, timeout=180,
         env={**os.environ, "REDIS_HOST": "127.0.0.1", "REDIS_PORT": "1",
-             "TF_CPP_MIN_LOG_LEVEL": "3", **env},
+             "TF_CPP_MIN_LOG_LEVEL": "3", "IDS_LOG_DIR": tempfile.mkdtemp(prefix="ids_test_logs_"),
+             **env},
     )
     assert r.returncode == 0, r.stderr[-2000:]
     return json.loads(r.stdout.strip().splitlines()[-1])

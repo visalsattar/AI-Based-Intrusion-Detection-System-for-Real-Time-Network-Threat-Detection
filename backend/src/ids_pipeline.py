@@ -265,6 +265,14 @@ class RealTimeIDSPipeline:
     # from this override (0.5% of flows, ~8.5 alerts/h, 3 of 8 CRITICAL on large downloads).
     AE_OVERRIDE_MAX_SEVERITY = "MEDIUM"
 
+    # A Random Forest P(attack) above RF_ALERT_CONF alerts on its own even when the fused score
+    # stays under the cutoff, at a fixed MEDIUM severity (never CRITICAL -> never AutoBlock).
+    # CICIDS2017 Friday pcap replay through the live pipeline (2 Oct 2026): recall 84.16% ->
+    # 98.72% on 96,811 DDoS flows, 0 false alerts on 22,951 other flows, and no new alerts on
+    # 81.5 min / 2,695 flows of live laptop traffic.
+    RF_ALERT_CONF = 0.70
+    RF_MODERATE_SEVERITY = "MEDIUM"
+
     # In the CICIDS2017 Friday CSV these flag columns only ever hold 0 or 1 (scaler max = 1),
     # i.e. flag *presence*, whereas BasicFlow.java and _extract_flow_features count packets
     # (live SYN=2, ACK=8, ...). Measured on lab_run2.csv (1 Oct 2026): feeding the raw counts
@@ -740,10 +748,15 @@ class RealTimeIDSPipeline:
         threat_names = [None] * len(flow_keys_batch)
         if self.random_forest is not None:
             try:
-                proba = self.random_forest.predict_proba(features_normalized)
+                rf_input = features_normalized
+                if hasattr(self.random_forest, "feature_names_in_"):
+                    # RFs fitted on a DataFrame (train_live_flow.py) warn on every batch otherwise.
+                    rf_input = pd.DataFrame(features_normalized,
+                                            columns=self.random_forest.feature_names_in_)
+                proba = self.random_forest.predict_proba(rf_input)
                 rf_attack_probs = attack_probability(proba, self.random_forest.classes_)
                 if self._rf_multiclass:
-                    preds = self.random_forest.predict(features_normalized)
+                    preds = self.random_forest.predict(rf_input)
                     threat_names = [
                         self._label_map.get(int(p), f"Class {p}") for p in preds
                     ]
@@ -1213,6 +1226,12 @@ class RealTimeIDSPipeline:
                 anomaly_score = max(fused_score, ae_score)
             if override_reason and anomaly_score <= alert_cutoff:
                 override_reason = None   # did not alert -> do not claim it did
+            # "low" sensitivity means fewer alerts: the moderate-confidence path is off there.
+            if (override_reason is None and anomaly_score <= alert_cutoff
+                    and rf_attack_prob > self.RF_ALERT_CONF
+                    and settings.get("sensitivity", "medium") != "low"):
+                override_reason = 'random forest (moderate confidence)'
+                anomaly_score = max(fused_score, rf_attack_prob)
         else:
             fused_score = ae_score
             anomaly_score = ae_score
@@ -1227,10 +1246,13 @@ class RealTimeIDSPipeline:
                 f"packets={flow['packets']} bytes={flow['bytes']} src={src_ip}"
             )
 
-        if anomaly_score > alert_cutoff:
+        rf_moderate = override_reason == 'random forest (moderate confidence)'
+        if anomaly_score > alert_cutoff or rf_moderate:
             severity = self._compute_severity(anomaly_score, settings)
             if override_reason and override_reason.startswith('autoencoder override'):
                 severity = self.AE_OVERRIDE_MAX_SEVERITY
+            if rf_moderate:
+                severity = self.RF_MODERATE_SEVERITY
 
             # Cooldown per (source, severity), not per port (port scans rotate ports).
             k = (src_ip, severity)

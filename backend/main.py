@@ -196,13 +196,16 @@ def resolve_interface(requested: str) -> str:
 # 7. Enterprise-Grade Logging Configuration
 # Create logs/ before FileHandler tries to open the file — setup_environment()
 # runs later, but the handler is instantiated here at import time.
-Path(os.path.join(BASE_DIR, 'logs')).mkdir(parents=True, exist_ok=True)
+# IDS_LOG_DIR lets tests (which import main and provoke rejections/failures on purpose)
+# write somewhere other than the operator's real backend/logs/ids.log.
+LOG_DIR = os.environ.get('IDS_LOG_DIR') or os.path.join(BASE_DIR, 'logs')
+Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] [%(name)s] [%(levelname)s] - %(message)s',
     handlers=[
         # Rotating: the pipeline logs every scored flow at INFO; a plain FileHandler grows forever.
-        RotatingFileHandler(os.path.join(BASE_DIR, 'logs', 'ids.log'),
+        RotatingFileHandler(os.path.join(LOG_DIR, 'ids.log'),
                             maxBytes=5 * 1024 * 1024, backupCount=3),
         logging.StreamHandler(sys.stdout)
     ]

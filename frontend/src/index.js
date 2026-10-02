@@ -25,6 +25,21 @@ if (savedToken) {
   axios.defaults.headers.common['Authorization'] = `Bearer ${savedToken}`;
 }
 
+// A 401 from the API means IDS_API_TOKEN is set on the backend and this browser has no (or a
+// wrong) token. Flag it once so the UI can say "token required" instead of a bare
+// "Disconnected" that looks like the server is down.
+window.idsAuthRequired = false;
+axios.interceptors.response.use(
+  (res) => res,
+  (err) => {
+    if (err?.response?.status === 401 && !window.idsAuthRequired) {
+      window.idsAuthRequired = true;
+      window.dispatchEvent(new Event('ids-auth-required'));
+    }
+    return Promise.reject(err);
+  }
+);
+
 const root = ReactDOM.createRoot(document.getElementById('root'));
 root.render(
   <React.StrictMode>

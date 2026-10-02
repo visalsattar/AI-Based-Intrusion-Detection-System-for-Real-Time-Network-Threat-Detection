@@ -280,6 +280,39 @@ def test_unconfirmed_ae_override_is_capped_and_never_autoblocks(pipeline, monkey
     assert blocked == []
 
 
+def test_moderate_rf_alone_alerts_at_medium_and_never_autoblocks(pipeline, monkeypatch):
+    """CICIDS pcap replay: RF P(attack) 0.7-0.9 with a calm AE was missed by the fused rule."""
+    pipeline.redis_client = FakeRedis()
+    blocked = []
+    monkeypatch.setattr(pipeline, "_load_settings", lambda: {"autoBlock": True})
+    monkeypatch.setattr(pipeline, "_should_block", lambda flow: True)
+    monkeypatch.setattr(pipeline, "_block", blocked.append)
+    flow_key = _make_flow(pipeline)
+
+    pipeline._process_prediction(flow_key, recon_error=0.0001, rf_attack_prob=0.75)
+
+    alert = pipeline.redis_client.alerts()[0]
+    assert alert["detection_source"] == "random forest (moderate confidence)"
+    assert alert["severity"] == "MEDIUM"
+    assert alert["anomaly_score"] == pytest.approx(0.75)
+    assert blocked == []
+
+
+def test_low_sensitivity_disables_the_moderate_rf_path(pipeline, monkeypatch):
+    pipeline.redis_client = FakeRedis()
+    monkeypatch.setattr(pipeline, "_load_settings", lambda: {"sensitivity": "low"})
+    flow_key = _make_flow(pipeline)
+    pipeline._process_prediction(flow_key, recon_error=0.0001, rf_attack_prob=0.75)
+    assert pipeline.redis_client.alerts() == []
+
+
+def test_rf_below_moderate_threshold_with_calm_ae_does_not_alert(pipeline):
+    pipeline.redis_client = FakeRedis()
+    flow_key = _make_flow(pipeline)
+    pipeline._process_prediction(flow_key, recon_error=0.0001, rf_attack_prob=0.65)
+    assert pipeline.redis_client.alerts() == []
+
+
 def test_ids_rf_dir_loads_rf_and_label_map_from_that_directory(tmp_path, monkeypatch):
     """IDS_RF_DIR swaps in a live-trained RF (train_live_flow.py) and its threat names."""
     import joblib

@@ -68,7 +68,18 @@ def test_token_required_when_configured(env, monkeypatch):
                   headers={"Authorization": "Bearer wrong"}).status_code == 401
     assert c.post("/api/save-settings", json={"sound": True},
                   headers={"Authorization": "Bearer t0ken"}).status_code == 200
-    assert c.get("/api/settings").status_code == 200        # reads stay open
+    # Reads are guarded too (a script can fake the Host header); only /api/health stays open.
+    for path in ("/api/settings", "/api/history", "/api/network-devices", "/api/threat-intel"):
+        assert c.get(path).status_code == 401, path
+        assert c.get(path, headers={"Authorization": "Bearer wrong"}).status_code == 401, path
+    assert c.get("/api/settings", headers={"Authorization": "Bearer t0ken"}).status_code == 200
+    assert c.get("/api/health").status_code in (200, 503)
+
+
+def test_reads_open_when_no_token_configured(env, monkeypatch):
+    c, _ = env
+    monkeypatch.delenv("IDS_API_TOKEN", raising=False)
+    assert c.get("/api/settings").status_code == 200
 
 
 def test_unknown_keys_are_dropped_not_persisted(env):

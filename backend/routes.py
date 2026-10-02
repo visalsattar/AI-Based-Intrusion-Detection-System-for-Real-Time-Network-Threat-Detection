@@ -290,6 +290,15 @@ def register_routes(app, redis_client=None):
         hostname = _request_hostname()
         if not hostname or hostname.lower() not in allowed_hosts():
             return jsonify({"status": "error", "message": "Host not allowed"}), 403
+        # The token guards READS too (alerts, the LAN's ARP table, threat intel): the Host
+        # check alone stops browsers, not scripts, which can send any Host header. The Socket.IO
+        # channel already required it for the same alert data. /api/health stays open for
+        # container healthchecks; it exposes only CPU/RAM/disk and Redis up/down.
+        token = os.environ.get("IDS_API_TOKEN")
+        if token and request.path != "/api/health":
+            supplied = request.headers.get("Authorization", "")
+            if not hmac.compare_digest(supplied.encode(), f"Bearer {token}".encode()):
+                return jsonify({"status": "error", "message": "Missing or invalid API token"}), 401
         if request.method not in ("POST", "PUT", "PATCH", "DELETE"):
             return None
         origin = request.headers.get("Origin")
@@ -297,11 +306,6 @@ def register_routes(app, redis_client=None):
             o = origin.rstrip("/")
             if urlparse(o).netloc != request.host and o not in allowed_origins():
                 return jsonify({"status": "error", "message": "Origin not allowed"}), 403
-        token = os.environ.get("IDS_API_TOKEN")
-        if token:
-            supplied = request.headers.get("Authorization", "")
-            if not hmac.compare_digest(supplied.encode(), f"Bearer {token}".encode()):
-                return jsonify({"status": "error", "message": "Missing or invalid API token"}), 401
         return None
 
     # ---------------- System health (real psutil metrics) ----------------
