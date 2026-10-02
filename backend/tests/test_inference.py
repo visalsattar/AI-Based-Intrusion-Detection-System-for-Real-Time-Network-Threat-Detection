@@ -442,3 +442,16 @@ def test_ae_led_alert_does_not_borrow_the_rf_attack_name(pipeline):
     alert = pipeline.redis_client.alerts()[0]
     assert alert["detection_source"].startswith("autoencoder override")
     assert alert["threat_type"] == "Network Anomaly"
+
+
+def test_multiclass_slow_attack_is_not_rate_gated_but_flood_class_is(pipeline, monkeypatch):
+    """multiday_v1: Brute Force / Bot are low-rate by nature; only DoS/DDoS verdicts need a flooding source."""
+    monkeypatch.setattr(pipeline, "_rf_multiclass", True)
+    pipeline.redis_client = FakeRedis()
+    flow_key = _make_flow(pipeline)                           # quiet source
+    pipeline._process_prediction(flow_key, recon_error=0.0001, rf_attack_prob=0.99, threat_name="Brute Force")
+    assert pipeline.redis_client.alerts()[0]["threat_type"] == "Brute Force"
+    pipeline.redis_client = FakeRedis(); pipeline._last_alert.clear()
+    flow_key = _make_flow(pipeline, sport=44445)
+    pipeline._process_prediction(flow_key, recon_error=0.0001, rf_attack_prob=0.99, threat_name="DDoS")
+    assert pipeline.redis_client.alerts() == []

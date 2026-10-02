@@ -285,6 +285,7 @@ class RealTimeIDSPipeline:
     RF_MIN_SRC_RATE = 10.0
     RATE_FLOOD_CONN_PER_S = 30.0
     RATE_FLOOD_SEVERITY = "HIGH"
+    RATE_GATED_CLASSES = frozenset({"DoS", "DDoS"})      # multi-class RF classes that must flood
 
     # In the CICIDS2017 Friday CSV these flag columns only ever hold 0 or 1 (scaler max = 1),
     # i.e. flag *presence*, whereas BasicFlow.java and _extract_flow_features count packets
@@ -1321,7 +1322,11 @@ class RealTimeIDSPipeline:
         src_rate = self._source_rate(src_ip, flow['last_seen'].timestamp())
         ae_led = bool(override_reason and override_reason.startswith('autoencoder override'))
         rf_driven = rf_attack_prob is not None and rf_attack_prob > 0.5 and not ae_led
-        if alerting and rf_driven and src_rate < self.RF_MIN_SRC_RATE:
+        # The gate encodes "a flood needs a high connection rate". It applies to binary RFs (their
+        # one attack class is a flood here) and to flood classes of a multi-class RF; slow attack
+        # classes such as Brute Force or Bot are not rate-gated (multiday_v1, 3 Oct 2026).
+        rate_gated_class = (not getattr(self, "_rf_multiclass", False)) or threat_name in self.RATE_GATED_CLASSES
+        if alerting and rf_driven and rate_gated_class and src_rate < self.RF_MIN_SRC_RATE:
             # The RF names a flood/DDoS pattern, but this source is not flooding.
             self._rate_gated = getattr(self, "_rate_gated", 0) + 1
             alerting = False
