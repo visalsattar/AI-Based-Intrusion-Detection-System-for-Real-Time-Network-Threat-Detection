@@ -4,7 +4,7 @@ Final Year Project — BS Computer Science, The University of Agriculture, Pesha
 
 A network intrusion detection system that monitors live traffic and scores flows in real time with a fused **Random Forest + Autoencoder** pipeline. A third model, a **CNN**, was trained and evaluated offline for architecture comparison only. It is **not** part of the live detection path (see [Why the CNN doesn't run live](#why-the-cnn-doesnt-run-live)).
 
-> **Status: detection is demonstrated for one attack family, not in general.** Replaying CIC's raw Friday packets through the live pipeline, the shipped models detect 98.7% of CICIDS2017 DDoS flows with no false alerts. An RF trained on the author's own lab captures detects a held-out run of that lab flood live. The shipped model does **not** detect the lab flood, and nothing here shows detection of other attack types. See [Live detection status](#live-detection-status).
+> **Status: detection is demonstrated for DDoS, PortScan and connection floods, not in general.** Replaying CIC's raw Friday packets through the live pipeline, the shipped model detects 99.4% of CICIDS2017 DDoS flows with no false alerts. An optional multi-day model detects 99.2% of CIC's PortScan flows. A connection-rate rule caught a real phone's flood over Wi-Fi within 1 second. Attack families a model was never trained on are **not** detected (leave-one-day-out: 0–1%). See [Live detection status](#live-detection-status).
 
 ## The problem
 
@@ -78,7 +78,7 @@ Held-out DDoS/benign flow-level evaluation:
 - The CNN result uses a separate 4,505-sequence subset (100-row windows, stride 10). It is **not** directly comparable to the flow-level rows.
 - These are experiment-specific results on one CICIDS2017 day (DDoS vs benign). They are not cross-dataset validation, not evidence for other CICIDS2017 attack families, and not a guarantee of live-network accuracy.
 - Training data is one binary task, DDoS vs benign. No PortScan, brute-force, web-attack or botnet detection is claimed.
-- The live extractor produces the full 78-feature input contract. Exact numerical equivalence with the CICFlowMeter (Java) build has not been established, but replaying CIC's raw Friday pcap through it gives RF recall 98.89% vs 99.74% on CIC's own CSV. It segments flows differently: 96,811 DDoS flows vs 128,027 CSV rows. The reference fixtures in `backend/tests/` are hand-calculated from CICFlowMeter V4 semantics; Java was not executed.
+- The live extractor produces the full 78-feature input contract. Exact numerical equivalence with the CICFlowMeter (Java) build has not been established, but replaying CIC's raw Friday pcap through it gives RF recall 99.43% vs 99.74% on CIC's own CSV. Two artefacts of the CICFlowMeter version CIC used are reproduced on purpose: Ethernet minimum-frame padding counts as payload (`COUNT_ETHERNET_PADDING`), and TCP flag counts, which CIC miscounted, are not used by the multi-day model. It segments flows differently: 96,811 DDoS flows vs 128,027 CSV rows. The reference fixtures in `backend/tests/` are hand-calculated from CICFlowMeter V4 semantics; Java was not executed.
 - Known train/serve fixes in the live path: the six Bulk features are forced to 0 (always 0 in training); flag-count features are clamped to 0/1 (0/1 in training); Subflow features equal the flow totals (as in training); Active/Idle use the 5 s activity timeout found in the training data. Several features are still always 0 live but non-zero in training (for example the packet-length minimums and the Idle statistics).
 
 ## Setup
@@ -244,7 +244,7 @@ cd backend
 python -m pytest tests/ -v
 ```
 
-Current result: **264 passed** (Windows 11, Python 3.11.9, 2026-10-02).
+Current result: **280 passed** (Windows 11, Python 3.11.9, 2026-10-02).
 
 Coverage areas: preprocessing, sequence construction and leakage regression, live inference/fusion logic, CICFlowMeter reference-fixture feature parity, flow scoring, route security and auth, threat-intelligence privacy, whitelist behaviour, and AutoBlock command behaviour. Two dependency deprecation warnings (Scapy/cryptography) are expected.
 
@@ -281,14 +281,18 @@ Controlled LAN lab runs on 2026-10-01 (laptop sensor on Ethernet, a second devic
 
 |                                                          | Recall | Precision | False alerts on other flows |
 | -------------------------------------------------------- | ------ | --------- | --------------------------- |
-| RF > 0.5                                                 | 98.89% | 100%      | 0                           |
-| Live rule (fused > 0.85, overrides, RF > 0.70 at MEDIUM) | 98.72% | 100%      | 0                           |
+| RF > 0.5                                                 | 99.43% | 100%      | 0                           |
+| Live rule (fused > 0.85, overrides, RF > 0.70 at MEDIUM) | 99.16% | 100%      | 1 (0.004%)                  |
 
-Two extractor bugs found by the replay were fixed first. Before the fixes, recall was 52%. Stray RST packets after a closed connection were becoming one-packet flows (47% of "attack" flows), and Active statistics were emitted without an idle gap, which never happens in CIC's data.
+Three extractor mismatches found by replays were fixed first; before them, recall was 52%. Ethernet padding (the third) also lifted the share of DDoS flows scored above 0.9 from almost none to 98.45%. Stray RST packets after a closed connection were becoming one-packet flows (47% of "attack" flows), and Active statistics were emitted without an idle gap, which never happens in CIC's data.
 
 **Lab-trained model** (`backend/train_live_flow.py`, `start-capture.ps1 -RfDir live_flow_v2`): an RF trained on the author's own captures (Wi-Fi flood, two WSL runs, benign traffic). On a **held-out** WSL flood run through the live pipeline it scored RF > 0.9 on 99.8% of flows. It raised HIGH "TCP Connect Flood (lab-trained)" alerts within 4 seconds, with ~100% of 66,001 connections captured and none dropped. On 737 unseen benign flows it raised no RF alerts. This is the same attack, tool and setup family it was trained on. It is not evidence for other attacks.
 
-So detection is demonstrated end to end for the CICIDS2017 DDoS (replayed) and for the lab flood (live, lab-trained model). Generalisation to other attack types, and the shipped model on non-CICIDS floods, is not.
+**Multi-day model** (`backend/train_multiday.py`, `IDS_RF_DIR=multiday_v2`, optional): a multi-class RF trained on all eight CICIDS2017 days (2.83 M flows; TCP flags, destination port and initial windows removed). Per-day chronological test: 91.4% of attacks detected, 93.6% precision, 0.52% benign false alarms. DDoS and PortScan ~99.5%; DoS 67%; Brute Force 48%; Bot 4%. **Leave-one-day-out** (attack family never seen in training): DoS 1.1%, Brute Force 0.03%, Web Attack 0.8%, Infiltration 0%, Bot 0%, PortScan 0.1%, DDoS 63.5%. **Live replay of CIC's PortScan window:** 99.19% recall at 99.90% precision (99.06% / 99.99% under the live rule).
+
+**Physical device test:** an Android phone on the same Wi-Fi flooded the laptop (9,484 connections). 98.7% captured, no drops. The first alert came 1 s after the flood began, and the "Connection Flood (rate)" alert fired at 33 connections/s; only 2 MEDIUM alerts during the normal phase. The lab-trained RF scored only 5% of the phone's flood flows as attacks (it had learned the VM link's timing), so detection on the real device came from the rate rule.
+
+So detection is demonstrated end to end for the CICIDS2017 DDoS and PortScan (replayed raw packets) and for connection floods from a VM and a real phone (live). Attack families a model was not trained on are not detected.
 
 ## Redis and persistence
 

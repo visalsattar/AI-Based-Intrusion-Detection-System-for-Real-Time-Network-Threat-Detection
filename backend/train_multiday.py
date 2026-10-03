@@ -69,6 +69,15 @@ def load_days(zip_path, names):
     return days
 
 
+# CICIDS2017's CICFlowMeter miscounted TCP flags: CIC's PortScan flows (SYN -> RST+ACK) are recorded
+# as PSH=1, SYN=0, RST=0, ACK=0. A model trained on them learns the artefact and fails on correctly
+# counted live flags (pcap replay 3 Oct 2026: 0.37% PortScan recall). --no-flags removes them all.
+FLAG_FEATURES = ("FIN Flag Count", "SYN Flag Count", "RST Flag Count", "PSH Flag Count", "ACK Flag Count",
+                 "URG Flag Count", "CWE Flag Count", "ECE Flag Count", "Fwd PSH Flags", "Bwd PSH Flags",
+                 "Fwd URG Flags", "Bwd URG Flags")
+DROP_FLAGS = False
+
+
 def preprocess(X, scaler):
     from ids_pipeline import RealTimeIDSPipeline as P
     from train_live_flow import SHORTCUT_FEATURES
@@ -76,6 +85,8 @@ def preprocess(X, scaler):
     for c in P.TRAINING_ZERO_FEATURES: X[c] = 0.0
     for c in P.TRAINING_BINARY_FEATURES: X[c] = (X[c] > 0).astype(float)
     for c in SHORTCUT_FEATURES: X[c] = 0.0
+    if DROP_FLAGS:
+        for c in FLAG_FEATURES: X[c] = 0.0
     return pd.DataFrame(scaler.transform(X), columns=X.columns)
 
 
@@ -107,13 +118,16 @@ def main(argv=None):
     ap.add_argument("--benign-cap", type=int, default=1_200_000)
     ap.add_argument("--class-cap", type=int, default=150_000)
     ap.add_argument("--skip-lodo", action="store_true")
+    ap.add_argument("--no-flags", action="store_true", help="zero all TCP flag features (CIC flag artefact)")
     args = ap.parse_args(argv)
+    global DROP_FLAGS
+    DROP_FLAGS = args.no_flags
     t0 = time.time()
     scaler = joblib.load("models/feature_scaler.pkl")
     names = [str(n) for n in scaler.feature_names_in_]
     print("Loading days:", flush=True)
     days = load_days(args.zip, names)
-    metrics = {"created": time.strftime("%Y-%m-%d %H:%M:%S"), "classes": CLASSES,
+    metrics = {"created": time.strftime("%Y-%m-%d %H:%M:%S"), "classes": CLASSES, "flags_zeroed": DROP_FLAGS,
                "dropped_nan_inf": {d: v[2] for d, v in days.items()}}
 
     # ---- A: per-day chronological 80/20 -------------------------------------------------------

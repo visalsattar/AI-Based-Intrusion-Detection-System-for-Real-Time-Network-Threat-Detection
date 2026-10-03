@@ -312,12 +312,21 @@ def test_extractor_puts_values_under_the_right_names_and_uses_payload_bytes(pipe
     assert f.shape == (78,) and np.isfinite(f).all()
 
 
-def test_ethernet_padding_is_not_counted_as_payload(pipe):
-    """A minimum-size frame carries 6 padding bytes that Scapy reports inside the TCP payload."""
+def _padded_syn():
     syn = Ether() / IP(src="8.8.4.4", dst="10.0.0.5") / TCP(sport=4444, dport=80, flags="S")
-    padded = Ether(bytes(syn) + b"\x00" * 6)
-    assert len(padded[TCP].payload) == 6              # what a naive len(payload) would say
-    feed(pipe, padded)
+    return Ether(bytes(syn) + b"\x00" * 6)          # 54-byte frame padded to the 60-byte minimum
+
+
+def test_ethernet_padding_counts_as_payload_like_cicids2017(pipe):
+    """CIC's CSV records a padded bare RST+ACK with 6 payload bytes (PortScan rows); match it."""
+    feed(pipe, _padded_syn())
+    f = pipe._extract_flow_features(next(iter(pipe.flow_tracker)))
+    assert f[idx("Total Length of Fwd Packets")] == 6
+
+
+def test_padding_can_be_excluded(pipe, monkeypatch):
+    monkeypatch.setattr(ids_pipeline, "COUNT_ETHERNET_PADDING", False)
+    feed(pipe, _padded_syn())
     f = pipe._extract_flow_features(next(iter(pipe.flow_tracker)))
     assert f[idx("Total Length of Fwd Packets")] == 0 and f[idx("act_data_pkt_fwd")] == 0
 

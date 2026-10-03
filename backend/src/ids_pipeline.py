@@ -139,6 +139,13 @@ def unblock_ip(ip) -> None:
         logger.error(f"[IPS] Failed to unblock {ip}: {e}")
 
 
+# CICIDS2017's CSV counts Ethernet minimum-frame padding as payload: a bare RST+ACK (54 bytes,
+# padded to 60) is recorded with 6 payload bytes (CIC PortScan rows: Bwd Packet Length Max 6,
+# Average Packet Size 3). Ignoring padding made every live port-scan probe differ from training
+# (pcap replay 3 Oct 2026: PortScan recall 0.38%). True = follow the training data.
+COUNT_ETHERNET_PADDING = True
+
+
 def _payload_len(p) -> int:
     """
     L4 payload bytes of one packet -- the quantity CICFlowMeter uses for every *Length* and
@@ -147,10 +154,13 @@ def _payload_len(p) -> int:
 
     len(p) is NOT that. On an Ethernet capture it also counts the 14-byte Ethernet header plus
     the IP and TCP/UDP headers, so a bare SYN measures 54 bytes live where CICIDS records 0.
-    Ethernet minimum-frame padding (Scapy exposes it inside the TCP payload) is ignored too.
+    Ethernet minimum-frame padding is counted as payload when COUNT_ETHERNET_PADDING is True,
+    because the CICIDS2017 training data does so (see the constant).
     """
     ip = p[IP]
     total = ip.len or len(ip)
+    if COUNT_ETHERNET_PADDING:
+        total = max(int(total), len(ip))      # len(ip) includes trailing padding bytes
     ihl = (ip.ihl or 5) * 4
     if TCP in p:
         l4 = (p[TCP].dataofs or 5) * 4
