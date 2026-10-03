@@ -1,0 +1,15 @@
+AI-Based IDS - how to run (double-click in this order)
+
+1-install-dev-dependencies.bat  only first time on a new laptop (pip + npm)
+2-start-docker.bat              Docker Desktop must be open first. Starts Redis + dashboard. Keep open.
+3-start-capture.bat             live capture (accept the Administrator prompt). Keep open.
+4-open-dashboard.bat            opens http://localhost:5000 -> should say Connected
+5-start-demo-target.bat         port 8080 target for the attack. Note the laptop IP. Keep open.
+6-send-scripts-to-phone.bat     only once: copy the attack scripts to Termux
+   then on the phone: python lab_flood.py LAPTOP-IP --seconds 60 --rate 220
+   -> within about 1 s the dashboard shows "Connection Flood (rate)" HIGH
+7-run-tests.bat                 run the test suite
+8-stop-everything.bat           stop Docker when finished
+
+Phone and laptop must be on the same Wi-Fi. Localhost traffic is NOT captured.
+Evidence: backend\evidence\alerts.jsonl

@@ -91,3 +91,6 @@ autoblock_state*.json
 # never commit local capture config or evidence output
 backend/config/whitelist.json
 backend/evidence/
+
+# Demo download file for lab_benign.py (random bytes, recreate with: python -c "import os;open('demo/blob.bin','wb').write(os.urandom(2097152))")
+demo/blob.bin
